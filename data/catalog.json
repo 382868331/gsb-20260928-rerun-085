@@ -1,0 +1,75 @@
+{
+  "components": [
+    {
+      "name": "web-app",
+      "description": "React 工作台应用",
+      "versions": [
+        {
+          "version": "1.4.0",
+          "dependencies": [
+            {"component": "react-ui", "constraint": "^18.2.0"},
+            {"component": "state-store", "constraint": "^4.1.0"},
+            {"component": "chart-kit", "constraint": "~2.3.0", "optional": true}
+          ]
+        },
+        {
+          "version": "2.0.0",
+          "dependencies": [
+            {"component": "react-ui", "constraint": "^19.0.0"},
+            {"component": "state-store", "constraint": "^5.0.0"},
+            {"component": "chart-kit", "constraint": "^3.0.0", "optional": true}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "react-ui",
+      "description": "界面基础组件",
+      "versions": [
+        {"version": "18.2.0", "dependencies": [{"component": "runtime-core", "constraint": "^2.0.0"}]},
+        {"version": "18.3.1", "dependencies": [{"component": "runtime-core", "constraint": "^2.2.0"}]},
+        {"version": "19.0.0", "dependencies": [{"component": "runtime-core", "constraint": "^3.0.0"}]},
+        {"version": "19.3.0", "dependencies": [{"component": "runtime-core", "constraint": "^3.1.0"}]}
+      ]
+    },
+    {
+      "name": "state-store",
+      "description": "状态管理库",
+      "versions": [
+        {"version": "4.1.0", "dependencies": [{"component": "runtime-core", "constraint": "^2.1.0"}]},
+        {"version": "4.2.2", "dependencies": [{"component": "runtime-core", "constraint": "^2.2.0"}]},
+        {"version": "5.0.0", "dependencies": [{"component": "runtime-core", "constraint": "^3.0.0"}]},
+        {"version": "5.1.3", "dependencies": [{"component": "runtime-core", "constraint": "^3.2.0"}]}
+      ]
+    },
+    {
+      "name": "runtime-core",
+      "description": "共享运行时",
+      "versions": [{"version": "2.1.0"}, {"version": "2.2.4"}, {"version": "3.0.0"}, {"version": "3.1.2"}, {"version": "3.2.1"}]
+    },
+    {
+      "name": "chart-kit",
+      "description": "可选图表组件",
+      "versions": [
+        {"version": "2.3.0", "dependencies": [{"component": "canvas-engine", "constraint": "^1.0.0"}]},
+        {"version": "2.3.5", "dependencies": [{"component": "canvas-engine", "constraint": "^1.2.0"}]},
+        {"version": "3.0.0", "dependencies": [{"component": "canvas-engine", "constraint": "^2.0.0"}]}
+      ]
+    },
+    {
+      "name": "canvas-engine",
+      "description": "图表渲染引擎",
+      "versions": [{"version": "1.0.0"}, {"version": "1.2.1"}, {"version": "2.0.0"}]
+    },
+    {
+      "name": "legacy-bridge",
+      "description": "循环依赖演示组件",
+      "versions": [{"version": "1.0.0", "dependencies": [{"component": "legacy-loop", "constraint": "=1.0.0"}]}]
+    },
+    {
+      "name": "legacy-loop",
+      "description": "反向引用桥接组件",
+      "versions": [{"version": "1.0.0", "dependencies": [{"component": "legacy-bridge", "constraint": "=1.0.0"}]}]
+    }
+  ]
+}
