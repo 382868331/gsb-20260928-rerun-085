@@ -57,7 +57,11 @@ func Solve(req domain.SolveRequest) domain.Report {
 		return fail(s.conflictMessage, s.conflictChain)
 	}
 	report := buildReport(req, best, changes, s)
-	verified := verifier.Verify(req.Manifest, report.Selection)
+	roots := []domain.Requirement{{Component: req.Target, Constraint: "=" + req.DesiredVersion}}
+	for name, version := range req.Locks {
+		roots = append(roots, domain.Requirement{Component: name, Constraint: "=" + version})
+	}
+	verified := verifier.Verify(req.Manifest, report.Selection, roots...)
 	report.Checks = verified.Checks
 	if verified.Status == "conflict" {
 		report.Status = "conflict"

@@ -62,8 +62,10 @@ type Report struct {
 }
 
 type Plan struct {
-	ID        string       `json:"id"`
-	Request   SolveRequest `json:"request"`
-	Report    Report       `json:"report"`
-	CreatedAt string       `json:"createdAt"`
+	ID         string       `json:"id"`
+	Request    SolveRequest `json:"request"`
+	Report     Report       `json:"report"`
+	Verify     Report       `json:"verify"`
+	Consistent bool         `json:"consistent"`
+	CreatedAt  string       `json:"createdAt"`
 }

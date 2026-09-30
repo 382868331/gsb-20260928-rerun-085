@@ -22,3 +22,11 @@ export type Report = {
   checks: Check[]
   optionalOmitted?: string[]
 }
+export type Plan = {
+  id: string
+  request: SolveRequest
+  report: Report
+  verify: Report
+  consistent: boolean
+  createdAt: string
+}

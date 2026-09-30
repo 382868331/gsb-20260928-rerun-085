@@ -39,3 +39,18 @@ th { color: #60708a; font-size: 12px; text-transform: uppercase; letter-spacing:
 .check.warning { border-color: #d97706; background: #fffbeb; }
 .check p { margin: 4px 0; }
 @media (max-width: 980px) { .grid, .result-grid { grid-template-columns: 1fr; } textarea { min-height: 360px; } header { align-items: flex-start; flex-direction: column; } }
+.scenarios { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.scenarios button { padding: 7px 12px; font-size: 13px; }
+.plan-library { margin-top: 18px; display: flex; flex-direction: column; gap: 18px; }
+.plan-library td, .plan-library th { font-size: 13px; }
+.plan-library .snapshot { max-width: 320px; color: #43526b; }
+.pick { display: inline-flex; align-items: center; gap: 2px; margin: 0 6px 0 0; font-size: 12px; }
+.pick input { width: auto; }
+td.feasible { color: #15803d; font-weight: 700; }
+td.conflict { color: #be123c; font-weight: 700; }
+.badge { margin-left: 8px; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+.badge.feasible { background: #dcfce7; color: #15803d; }
+.badge.conflict { background: #ffe4e6; color: #be123c; }
+tr.diff td { background: #fef9c3; }
+.conflict-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+@media (max-width: 980px) { .conflict-compare { grid-template-columns: 1fr; } }

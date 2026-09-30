@@ -3,12 +3,13 @@ package verifier
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"dependency-workbench/internal/domain"
 	"dependency-workbench/internal/semver"
 )
 
-func Verify(manifest domain.Manifest, selection map[string]string) domain.Report {
+func Verify(manifest domain.Manifest, selection map[string]string, roots ...domain.Requirement) domain.Report {
 	versions := map[string]map[string]domain.Version{}
 	for _, component := range manifest.Components {
 		versions[component.Name] = map[string]domain.Version{}
@@ -22,6 +23,24 @@ func Verify(manifest domain.Manifest, selection map[string]string) domain.Report
 		selectedComponents = append(selectedComponents, name)
 	}
 	sort.Strings(selectedComponents)
+
+	// Root requirements (the upgrade request and manual locks) anchor the
+	// selection: an empty or truncated selection must not verify as feasible.
+	for _, root := range roots {
+		chosen, included := selection[root.Component]
+		if !included {
+			if _, known := versions[root.Component]; !known {
+				checks = append(checks, domain.Check{Kind: "selection", Status: "error", Message: fmt.Sprintf("required component %q is not present in the manifest", root.Component), Chain: []domain.ChainLink{{From: "upgrade request", To: root.Component, Constraint: root.Constraint}}})
+				continue
+			}
+			checks = append(checks, domain.Check{Kind: "selection", Status: "error", Message: fmt.Sprintf("required component %s is missing from the selection", root.Component), Chain: []domain.ChainLink{{From: "upgrade request", To: root.Component, Constraint: root.Constraint}}})
+			continue
+		}
+		v, _ := semver.Parse(chosen)
+		if !semver.Satisfies(v, strings.TrimPrefix(root.Constraint, "=")) {
+			checks = append(checks, domain.Check{Kind: "selection", Status: "error", Message: fmt.Sprintf("%s %s does not satisfy %s from upgrade request", root.Component, chosen, root.Constraint), Chain: []domain.ChainLink{{From: "upgrade request", To: root.Component, Constraint: root.Constraint}}})
+		}
+	}
 
 	for _, name := range selectedComponents {
 		version := selection[name]

@@ -1,9 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import { loadSample, savePlan, solve, verify } from './api'
+import { listPlans, loadSample, savePlan, solve, verify } from './api'
 import { Chain } from './Chain'
-import type { Report, SolveRequest } from './types'
+import { Compare } from './Compare'
+import type { Manifest, Plan, Report, SolveRequest } from './types'
 
 const EMPTY: SolveRequest = { manifest: { components: [] }, current: {}, target: '', desiredVersion: '', locks: {} }
+const SCENARIOS: { id: string; label: string }[] = [
+  { id: 'default', label: '常规升级' },
+  { id: 'cycle', label: '循环依赖' },
+  { id: 'lock-conflict', label: '锁定版本冲突' },
+  { id: 'missing-candidate', label: '不存在候选' },
+]
 
 export default function App() {
   const [draft, setDraft] = useState<SolveRequest>(EMPTY)
@@ -12,6 +19,9 @@ export default function App() {
   const [report, setReport] = useState<Report | null>(null)
   const [savedReport, setSavedReport] = useState<Report | null>(null)
   const [independentReport, setIndependentReport] = useState<Report | null>(null)
+  const [plans, setPlans] = useState<Plan[]>([])
+  const [compareIds, setCompareIds] = useState<(string | null)[]>([null, null])
+  const [currentChecks, setCurrentChecks] = useState<Record<string, Report>>({})
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -22,7 +32,34 @@ export default function App() {
         setJsonText(JSON.stringify({ manifest: sample.manifest, current: sample.current }, null, 2))
       })
       .catch((err) => setError(String(err)))
+    refreshPlans()
   }, [])
+
+  async function refreshPlans() {
+    try {
+      setPlans(await listPlans())
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  async function chooseScenario(id: string) {
+    setBusy(true)
+    setError('')
+    try {
+      const sample = await loadSample(id)
+      setDraft(sample)
+      setJsonText(JSON.stringify({ manifest: sample.manifest, current: sample.current }, null, 2))
+      setLocksText(JSON.stringify(sample.locks ?? {}))
+      setReport(null)
+      setSavedReport(null)
+      setIndependentReport(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const targetVersions = useMemo(() => {
     return draft.manifest.components.find((item) => item.name === draft.target)?.versions.map((item) => item.version) ?? []
@@ -49,10 +86,11 @@ export default function App() {
         const saved = await savePlan(payload)
         setSavedReport(saved.report)
         setReport(saved.report)
-        setIndependentReport(await verify(payload.manifest, saved.report.selection))
+        setIndependentReport(saved.verify)
+        await refreshPlans()
       }
       if (action === 'verify' && report) {
-        setIndependentReport(await verify(payload.manifest, report.selection))
+        setIndependentReport(await verify(payload.manifest, report.selection, { target: payload.target, desiredVersion: payload.desiredVersion, locks: payload.locks }))
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -60,6 +98,23 @@ export default function App() {
       setBusy(false)
     }
   }
+
+  async function recheckWithCurrentManifest(plan: Plan) {
+    setBusy(true)
+    setError('')
+    try {
+      const parsed = JSON.parse(jsonText) as Pick<SolveRequest, 'manifest' | 'current'>
+      const manifest: Manifest = parsed.manifest
+      const result = await verify(manifest, plan.report.selection, { target: plan.request.target, desiredVersion: plan.request.desiredVersion, locks: plan.request.locks })
+      setCurrentChecks((prev) => ({ ...prev, [plan.id]: result }))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const comparePlans = compareIds.map((id) => plans.find((plan) => plan.id === id) ?? null)
 
   return (
     <main>
@@ -78,6 +133,11 @@ export default function App() {
         <div className="card">
           <h2>本地虚构版本资料</h2>
           <p className="hint">输入 manifest 和 current；后续真实包管理器格式可在此处增加适配层。</p>
+          <div className="scenarios">
+            {SCENARIOS.map((item) => (
+              <button key={item.id} onClick={() => void chooseScenario(item.id)} disabled={busy}>{item.label}</button>
+            ))}
+          </div>
           <textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} spellCheck={false} />
         </div>
 
@@ -103,6 +163,16 @@ export default function App() {
       </section>
 
       {report ? <Result report={report} saved={savedReport} independent={independentReport} /> : null}
+
+      <PlanLibrary
+        plans={plans}
+        compareIds={compareIds}
+        onPick={(slot, id) => setCompareIds((prev) => prev.map((value, index) => (index === slot ? id : value)))}
+        comparePlans={comparePlans}
+        currentChecks={currentChecks}
+        onRecheck={(plan) => void recheckWithCurrentManifest(plan)}
+        busy={busy}
+      />
     </main>
   )
 }
@@ -151,6 +221,66 @@ function Result({ report, saved, independent }: { report: Report; saved: Report 
         ))}
         {consistency === true ? <p className="success-text">页面结论与独立核验一致。</p> : null}
         {consistency === false ? <p className="error-text">页面结论与独立核验不一致。</p> : null}
+      </div>
+    </section>
+  )
+}
+
+function PlanLibrary({
+  plans,
+  compareIds,
+  onPick,
+  comparePlans,
+  currentChecks,
+  onRecheck,
+  busy,
+}: {
+  plans: Plan[]
+  compareIds: (string | null)[]
+  onPick: (slot: number, id: string) => void
+  comparePlans: (Plan | null)[]
+  currentChecks: Record<string, Report>
+  onRecheck: (plan: Plan) => void
+  busy: boolean
+}) {
+  return (
+    <section className="plan-library">
+      <div className="card">
+        <h2>已保存方案（保存时快照，不随后续改约束而改变）</h2>
+        {plans.length === 0 ? <p className="hint">还没有保存方案。</p> : (
+          <table>
+            <thead><tr><th>比较</th><th>ID</th><th>目标</th><th>求解</th><th>独立核验</th><th>选择快照</th><th>按当前资料复核</th><th>保存时间</th></tr></thead>
+            <tbody>
+              {[...plans].reverse().map((plan) => {
+                const current = currentChecks[plan.id]
+                return (
+                  <tr key={plan.id}>
+                    <td>
+                      <label className="pick"><input type="radio" name="compare-a" checked={compareIds[0] === plan.id} onChange={() => onPick(0, plan.id)} />A</label>
+                      <label className="pick"><input type="radio" name="compare-b" checked={compareIds[1] === plan.id} onChange={() => onPick(1, plan.id)} />B</label>
+                    </td>
+                    <td>{plan.id.slice(0, 8)}</td>
+                    <td>{plan.request.target} @ {plan.request.desiredVersion}</td>
+                    <td className={plan.report.status}>{plan.report.status}</td>
+                    <td className={plan.verify.status}>{plan.verify.status}{plan.consistent ? '' : '（与求解不一致）'}</td>
+                    <td className="snapshot">{Object.entries(plan.report.selection).sort().map(([name, version]) => name + '@' + version).join('，') || '—'}</td>
+                    <td>
+                      <button onClick={() => onRecheck(plan)} disabled={busy}>用当前资料复核</button>
+                      {current ? <span className={'badge ' + current.status}>{current.status}</span> : null}
+                    </td>
+                    <td>{plan.createdAt}</td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+        <p className="hint">复核只使用页面上当前编辑的 manifest 重新检查保存时的选择快照，旧方案本身的版本不会被改写。</p>
+      </div>
+
+      <div className="card">
+        <h2>方案比较：实际改变与冲突依赖链</h2>
+        <Compare left={comparePlans[0]} right={comparePlans[1]} />
       </div>
     </section>
   )

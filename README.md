@@ -26,11 +26,15 @@
 
 ## API
 
-- GET /api/sample：获取虚构样例。
+- GET /api/sample?scenario=default|cycle|lock-conflict|missing-candidate：获取虚构样例（循环依赖、锁定版本冲突、不存在候选三类冲突资料）。
 - POST /api/solve：求解迁移方案。
-- POST /api/plans：保存方案，并执行独立核验。
-- POST /api/plans/verify：只对给定选择执行独立核验。
+- POST /api/plans：保存方案；服务端重跑求解器和独立 verifier，连同请求快照一起持久化（旧方案不随后续改约束而改变）。
+- POST /api/plans/verify：只对给定选择执行独立核验，可带 target/desiredVersion/locks 锚定根约束，空选择不会被误判为可行。
 - GET /api/plans：查看已保存方案。
+
+页面支持：切换冲突样例、锁定组件后重算、在方案库中选择两个方案比较实际改变与冲突依赖链、用当前 manifest 复核历史方案的保存版本。
+
+可用 `-addr`、`-data`（或 `PLAN_STORE`）、`-static`（或 `STATIC_DIR`）覆盖监听地址、方案存储路径和前端目录。
 
 ## 测试
 
