@@ -22,3 +22,17 @@ export type Report = {
   checks: Check[]
   optionalOmitted?: string[]
 }
+export type Scenario = {
+  id: string
+  name: string
+  description: string
+  request: SolveRequest
+}
+export type Plan = {
+  id: string
+  request: SolveRequest
+  report: Report
+  verification: Report
+  consistent: boolean
+  createdAt: string
+}

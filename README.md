@@ -26,11 +26,16 @@
 
 ## API
 
-- GET /api/sample：获取虚构样例。
-- POST /api/solve：求解迁移方案。
-- POST /api/plans：保存方案，并执行独立核验。
-- POST /api/plans/verify：只对给定选择执行独立核验。
-- GET /api/plans：查看已保存方案。
+- GET /api/scenarios：列出内置资料（常规升级、循环依赖、锁定版本冲突、不存在候选）。
+- GET /api/sample?id=base：获取指定资料的完整求解请求。
+- POST /api/solve：求解迁移方案，冲突时返回从升级请求/锁定出发的完整依赖链。
+- POST /api/plans：保存方案；服务端冻结请求中的 manifest 快照，并调用独立 verifier 重新核验，返回 consistent 结论，不采信求解阶段标记。
+- POST /api/plans/verify：只对给定 manifest 与选择执行独立核验。
+- GET /api/plans：查看已保存方案（含快照与独立核验报告）。
+
+保存后即使修改页面上的约束，旧方案仍保留保存时的 manifest 副本、版本选择和核验结论；可在页面上对同一批方案使用不同锁定进行并排对比。
+
+计划文件默认写入工作目录的 plans.json，可用环境变量 PLANS_PATH 覆盖；监听地址用 ADDR（默认 :8080）。
 
 ## 测试
 

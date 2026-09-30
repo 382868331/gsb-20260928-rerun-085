@@ -129,10 +129,7 @@ func newState(req domain.SolveRequest) *state {
 func (s *state) search() (map[string]string, []domain.Change, bool) {
 	if s.propagationConflict != nil {
 		bad := *s.propagationConflict
-		s.conflictChain = s.pathFor(bad.link.To)
-		if len(s.conflictChain) == 0 {
-			s.conflictChain = []domain.ChainLink{bad.link}
-		}
+		s.conflictChain = s.fullChainFor(bad.link)
 		s.conflictMessage = fmt.Sprintf("selected %s %s does not satisfy %s from %s %s", bad.link.To, s.assignment[bad.link.To], bad.link.Constraint, bad.link.From, bad.link.FromVersion)
 		return nil, nil, false
 	}
@@ -153,6 +150,12 @@ func (s *state) search() (map[string]string, []domain.Change, bool) {
 		}
 		domainValues, chain, message := s.domain(name)
 		if len(domainValues) == 0 {
+			if len(chain) > 0 {
+				first := chain[0]
+				if root := s.rootEdgeFor(first.From); root != nil {
+					chain = append([]domain.ChainLink{*root}, chain...)
+				}
+			}
 			s.conflictChain, s.conflictMessage = chain, message
 			return nil, nil, false
 		}
@@ -242,6 +245,16 @@ func rank(version string) int {
 
 func (s *state) assign(name, version string) {
 	s.assignment[name] = version
+	// A component can be assigned after the components depending on it (manual
+	// locks are applied after the upgrade target), so incoming constraints must
+	// be checked here as well as when the dependency edge is added.
+	for _, incoming := range s.edges[name] {
+		v, _ := semver.Parse(version)
+		if !semver.Satisfies(v, strings.TrimPrefix(incoming.link.Constraint, "=")) {
+			bad := edge{link: domain.ChainLink{From: incoming.link.From, FromVersion: incoming.link.FromVersion, To: name, Constraint: incoming.link.Constraint, Optional: incoming.link.Optional}}
+			s.propagationConflict = &bad
+		}
+	}
 	for _, componentVersion := range s.versions[name] {
 		if componentVersion.Version != version {
 			continue
@@ -352,6 +365,52 @@ func (s *state) pathFor(destination string) []domain.ChainLink {
 		}
 	}
 	return nil
+}
+
+// fullChainFor prepends the pseudo edges (upgrade request / manual lock) to
+// the discovered dependency path so the page can show where the conflict
+// starts as well as the failing requirement.
+func (s *state) fullChainFor(bad domain.ChainLink) []domain.ChainLink {
+	chain := s.pathFor(bad.To)
+	// Prefer a path ending exactly at the bad edge; if the BFS path already
+	// contains the bad requirement drop its tail and re-append the bad edge.
+	chain = appendChainEnding(chain, bad)
+	if from := bad.From; from != "upgrade request" && from != "manual lock" {
+		if root := s.rootEdgeFor(from); root != nil {
+			chain = append([]domain.ChainLink{*root}, chain...)
+		}
+	}
+	if len(chain) == 0 {
+		chain = []domain.ChainLink{bad}
+	}
+	return chain
+}
+
+func (s *state) rootEdgeFor(component string) *domain.ChainLink {
+	for _, item := range s.edges[component] {
+		if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+			link := item.link
+			return &link
+		}
+	}
+	return nil
+}
+
+func appendChainEnding(path []domain.ChainLink, bad domain.ChainLink) []domain.ChainLink {
+	// If the BFS already ended with the same edge, keep it.
+	if len(path) > 0 {
+		last := path[len(path)-1]
+		if last.From == bad.From && last.To == bad.To && last.Constraint == bad.Constraint {
+			return path
+		}
+	}
+	// BFS may have reached bad.To via another edge; replace the final edge if
+	// it points at the same component, otherwise just append context.
+	if len(path) > 0 && path[len(path)-1].To == bad.To {
+		path[len(path)-1] = bad
+		return path
+	}
+	return append(path, bad)
 }
 
 func buildReport(req domain.SolveRequest, selection map[string]string, changes []domain.Change, s *state) domain.Report {

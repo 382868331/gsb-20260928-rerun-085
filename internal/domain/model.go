@@ -62,8 +62,13 @@ type Report struct {
 }
 
 type Plan struct {
-	ID        string       `json:"id"`
-	Request   SolveRequest `json:"request"`
-	Report    Report       `json:"report"`
-	CreatedAt string       `json:"createdAt"`
+	ID      string       `json:"id"`
+	Request SolveRequest `json:"request"`
+	Report  Report       `json:"report"`
+	// Verification is produced independently from the solver report, against
+	// the manifest snapshot stored in Request. It must never be copied from
+	// Report even when the solver marked the selection feasible.
+	Verification Report `json:"verification"`
+	Consistent   bool   `json:"consistent"`
+	CreatedAt    string `json:"createdAt"`
 }
