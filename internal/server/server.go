@@ -63,8 +63,14 @@ func (s *Server) handleSolve(w http.ResponseWriter, r *http.Request) {
 }
 
 type verifyRequest struct {
-	Manifest  domain.Manifest   `json:"manifest"`
-	Selection map[string]string `json:"selection"`
+	Manifest       domain.Manifest        `json:"manifest"`
+	Selection      map[string]string      `json:"selection"`
+	Target         string                 `json:"target,omitempty"`
+	DesiredVersion string                 `json:"desiredVersion,omitempty"`
+	Goals          []domain.MigrationGoal `json:"goals,omitempty"`
+	Confirmed      map[string]string      `json:"confirmed,omitempty"`
+	Current        map[string]string      `json:"current,omitempty"`
+	Locks          map[string]string      `json:"locks,omitempty"`
 }
 
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -77,11 +83,16 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	selection := payload.Selection
-	if selection == nil {
-		selection = map[string]string{}
+	req := domain.SolveRequest{
+		Manifest:       payload.Manifest,
+		Current:        payload.Current,
+		Target:         payload.Target,
+		DesiredVersion: payload.DesiredVersion,
+		Locks:          payload.Locks,
+		Goals:          payload.Goals,
+		Confirmed:      payload.Confirmed,
 	}
-	writeJSON(w, http.StatusOK, verifier.Verify(payload.Manifest, selection))
+	writeJSON(w, http.StatusOK, verifier.VerifyRequest(req, payload.Selection))
 }
 
 func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
@@ -91,6 +102,11 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		for i := range plans {
+			verification := verifier.VerifyRequest(plans[i].Request, plans[i].Report.Selection)
+			plans[i].Verification = verification
+			plans[i].Consistent = consistent(plans[i].Report, verification)
 		}
 		writeJSON(w, http.StatusOK, plans)
 	case http.MethodPost:
@@ -102,7 +118,7 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 		report := solver.Solve(req)
 		// Independent re-check against the exact manifest snapshot carried in
 		// the request. The solver status is deliberately not trusted.
-		verification := verifier.Verify(req.Manifest, report.Selection)
+		verification := verifier.VerifyRequest(req, report.Selection)
 		plan := domain.Plan{
 			ID:           newID(),
 			Request:      req,

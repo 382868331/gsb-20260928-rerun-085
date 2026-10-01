@@ -79,7 +79,7 @@ export default function App() {
         await refreshPlans()
       }
       if (action === 'verify' && report) {
-        setIndependentReport(await verify(payload.manifest, report.selection))
+        setIndependentReport(await verify(payload, report.selection))
       }
       if (action === 'compare') {
         const result = await solve(payload)
@@ -153,7 +153,7 @@ export default function App() {
       <SavedPlans
         plans={plans}
         onReverify={async (plan) => {
-          const result = await verify(plan.request.manifest, plan.report.selection)
+          const result = await verify(plan.request, plan.report.selection)
           setPlans((items) => items.map((item) => item.id === plan.id ? { ...item, verification: result, consistent: plan.report.status === result.status } : item))
           return result
         }}
@@ -259,6 +259,26 @@ function Result({ report, saved, independent }: { report: Report; saved: Report 
           {Object.entries(report.selection).sort().map(([name, version]) => <span key={name}>{name + '@' + version}</span>)}
         </div>
       </div>
+
+      {report.goalStatuses?.length ? (
+        <div className="card">
+          <h2>迁移目标覆盖</h2>
+          <table>
+            <thead><tr><th>目标</th><th>要求</th><th>选中</th><th>状态</th><th>原因</th></tr></thead>
+            <tbody>
+              {report.goalStatuses.map((goal) => (
+                <tr key={goal.component + '@' + goal.required}>
+                  <td>{goal.component}</td>
+                  <td>{goal.required}</td>
+                  <td>{goal.selected || '—'}</td>
+                  <td className={goal.status === 'satisfied' ? 'success-text' : 'error-text'}>{goal.status}</td>
+                  <td>{goal.reason || '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
 
       <div className="card">
         <h2>循环依赖与可选依赖检查</h2>

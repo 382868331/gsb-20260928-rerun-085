@@ -82,8 +82,11 @@ func TestScenariosPageAndVerifierAgree(t *testing.T) {
 			}
 			selection, _ := solved["selection"].(map[string]any)
 			_, verified := do(t, handler, http.MethodPost, "/api/plans/verify", map[string]any{
-				"manifest":  req.Manifest,
-				"selection": selection,
+				"manifest":       req.Manifest,
+				"selection":      selection,
+				"target":         req.Target,
+				"desiredVersion": req.DesiredVersion,
+				"goals":          req.Goals,
 			})
 			// An empty selection is trivially feasible for the verifier; the
 			// conflict-path agreement for these scenarios is checked below.
@@ -112,8 +115,10 @@ func TestConflictScenariosReportChainsAndErrors(t *testing.T) {
 		// The independent verifier must reject the same selection when asked
 		// directly: app 2.0.0 -> lib 3.0.0 violates ^2.0.0.
 		_, verified := do(t, handler, http.MethodPost, "/api/plans/verify", map[string]any{
-			"manifest":  req.Manifest,
-			"selection": map[string]string{"app": "2.0.0", "lib": "3.0.0"},
+			"manifest":       req.Manifest,
+			"selection":      map[string]string{"app": "2.0.0", "lib": "3.0.0"},
+			"target":         req.Target,
+			"desiredVersion": req.DesiredVersion,
 		})
 		if got, _ := verified["status"].(string); got != "conflict" {
 			t.Fatalf("verifier should flag locked lib 3.0.0, got %v", verified)
@@ -131,8 +136,10 @@ func TestConflictScenariosReportChainsAndErrors(t *testing.T) {
 		req := scenario(t, handler, "cycle")
 		_, solved := do(t, handler, http.MethodPost, "/api/solve", req)
 		_, verified := do(t, handler, http.MethodPost, "/api/plans/verify", map[string]any{
-			"manifest":  req.Manifest,
-			"selection": solved["selection"],
+			"manifest":       req.Manifest,
+			"selection":      solved["selection"],
+			"target":         req.Target,
+			"desiredVersion": req.DesiredVersion,
 		})
 		checks, _ := verified["checks"].([]any)
 		found := false
@@ -150,6 +157,50 @@ func TestConflictScenariosReportChainsAndErrors(t *testing.T) {
 			t.Fatalf("expected cycle warning, got %v", checks)
 		}
 	})
+}
+
+func TestIndependentVerificationUsesGoalContextAndRejectsEmptySelection(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "base")
+	_, verified := do(t, handler, http.MethodPost, "/api/plans/verify", map[string]any{
+		"manifest":       req.Manifest,
+		"selection":      map[string]string{},
+		"target":         req.Target,
+		"desiredVersion": req.DesiredVersion,
+	})
+	if got, _ := verified["status"].(string); got != "conflict" {
+		t.Fatalf("empty selection must not be feasible against a goal, got %v", verified)
+	}
+	statuses, _ := verified["goalStatuses"].([]any)
+	if len(statuses) != 1 {
+		t.Fatalf("expected one goal status, got %v", statuses)
+	}
+	first, _ := statuses[0].(map[string]any)
+	if first["status"] != "pending" || first["reason"] == "" {
+		t.Fatalf("expected pending goal with reason, got %v", first)
+	}
+}
+
+func TestSolveHonorsConfirmedComponentsForRemainingGoals(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "base")
+	req.Confirmed = map[string]string{"lib": "2.1.0"}
+	_, solved := do(t, handler, http.MethodPost, "/api/solve", req)
+	if got, _ := solved["status"].(string); got != "feasible" {
+		t.Fatalf("confirmed compatible lib should allow remaining app goal, got %v", solved)
+	}
+	selection, _ := solved["selection"].(map[string]any)
+	if selection["app"] != "2.0.0" || selection["lib"] != "2.1.0" {
+		t.Fatalf("unexpected selection: %v", selection)
+	}
+	statuses, _ := solved["goalStatuses"].([]any)
+	if len(statuses) != 1 {
+		t.Fatalf("expected app goal status, got %v", statuses)
+	}
+	first, _ := statuses[0].(map[string]any)
+	if first["status"] != "satisfied" {
+		t.Fatalf("expected satisfied app goal, got %v", first)
+	}
 }
 
 // Saving must snapshot the request and re-verify it independently. Changing
@@ -226,8 +277,10 @@ func TestSavedPlanKeepsSnapshotWhenConstraintsChange(t *testing.T) {
 	// the page and verifier react to the changed constraints rather than the
 	// stale solver success flag.
 	_, reverified := do(t, handler, http.MethodPost, "/api/plans/verify", map[string]any{
-		"manifest":  req.Manifest,
-		"selection": storedReport.Selection,
+		"manifest":       req.Manifest,
+		"selection":      storedReport.Selection,
+		"target":         "app",
+		"desiredVersion": "2.0.0",
 	})
 	if got, _ := reverified["status"].(string); got != "conflict" {
 		t.Fatalf("lib 2.0.0 must conflict with new ^3.0.0 constraint, got %v", reverified)

@@ -20,12 +20,27 @@ type Manifest struct {
 	Components []Component `json:"components"`
 }
 
+type MigrationGoal struct {
+	Component string `json:"component"`
+	Version   string `json:"version"`
+}
+
+type GoalStatus struct {
+	Component string `json:"component"`
+	Required  string `json:"required"`
+	Selected  string `json:"selected,omitempty"`
+	Status    string `json:"status"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 type SolveRequest struct {
 	Manifest       Manifest          `json:"manifest"`
 	Current        map[string]string `json:"current"`
 	Target         string            `json:"target"`
 	DesiredVersion string            `json:"desiredVersion"`
 	Locks          map[string]string `json:"locks,omitempty"`
+	Goals          []MigrationGoal   `json:"goals,omitempty"`
+	Confirmed      map[string]string `json:"confirmed,omitempty"`
 }
 
 type Change struct {
@@ -53,6 +68,7 @@ type Check struct {
 type Report struct {
 	Status          string            `json:"status"`
 	Selection       map[string]string `json:"selection"`
+	GoalStatuses    []GoalStatus      `json:"goalStatuses,omitempty"`
 	Changes         []Change          `json:"changes"`
 	ChangedCount    int               `json:"changedCount"`
 	ConflictChain   []ChainLink       `json:"conflictChain,omitempty"`

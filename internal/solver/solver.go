@@ -17,6 +17,7 @@ type edge struct {
 type state struct {
 	current             map[string]string
 	locks               map[string]string
+	roots               map[string]bool
 	versions            map[string][]domain.Version
 	assignment          map[string]string
 	edges               map[string][]edge
@@ -33,32 +34,51 @@ func Solve(req domain.SolveRequest) domain.Report {
 	if err := validate(req); err != nil {
 		return fail(err.Error(), nil)
 	}
+	req.Goals = normalizedGoals(req)
+	if duplicate := conflictingGoals(req.Goals); duplicate != nil {
+		return fail(fmt.Sprintf("migration goals require different versions of %s: %s", duplicate.Component, strings.Join(goalVersions(req.Goals, duplicate.Component), " and ")), nil)
+	}
+	mergeConfirmedLocks(&req)
 	s := newState(req)
-	if !s.versionExists(req.Target, req.DesiredVersion) {
-		return fail(fmt.Sprintf("target version %s %s does not exist in the manifest", req.Target, req.DesiredVersion), nil)
+	for _, goal := range req.Goals {
+		if !s.versionExists(goal.Component, goal.Version) {
+			return fail(fmt.Sprintf("target version %s %s does not exist in the manifest", goal.Component, goal.Version), nil)
+		}
 	}
 	for name, version := range req.Locks {
 		if !s.versionExists(name, version) {
 			return fail(fmt.Sprintf("locked version %s %s does not exist in the manifest", name, version), nil)
 		}
 	}
-	s.required[req.Target] = true
-	s.assign(req.Target, req.DesiredVersion)
-	s.edges[req.Target] = []edge{{link: domain.ChainLink{From: "upgrade request", To: req.Target, Constraint: "=" + req.DesiredVersion}}}
-	for name, version := range req.Locks {
+	for _, goal := range req.Goals {
+		name := goal.Component
 		s.required[name] = true
+		s.roots[name] = true
+		s.assign(name, goal.Version)
+		s.edges[name] = append(s.edges[name], edge{link: domain.ChainLink{From: "migration goal", To: name, Constraint: "=" + goal.Version}})
+	}
+	for name, version := range req.Locks {
+		if s.assignment[name] == version {
+			continue
+		}
+		s.required[name] = true
+		s.roots[name] = true
 		s.assign(name, version)
-		s.edges[name] = append(s.edges[name], edge{link: domain.ChainLink{From: "manual lock", To: name, Constraint: "=" + version}})
+		s.edges[name] = append(s.edges[name], edge{link: domain.ChainLink{From: "confirmed selection", To: name, Constraint: "=" + version}})
 	}
 	s.bestCount = len(req.Current) + 1
 	s.bestMovement = int(^uint(0) >> 1)
 	best, changes, ok := s.search()
 	if !ok {
-		return fail(s.conflictMessage, s.conflictChain)
+		report := fail(s.conflictMessage, s.conflictChain)
+		verified := verifier.VerifyRequest(req, report.Selection)
+		report.GoalStatuses = markGoalsUnmet(verified.GoalStatuses, s.conflictMessage)
+		return report
 	}
 	report := buildReport(req, best, changes, s)
-	verified := verifier.Verify(req.Manifest, report.Selection)
+	verified := verifier.VerifyRequest(req, report.Selection)
 	report.Checks = verified.Checks
+	report.GoalStatuses = verified.GoalStatuses
 	if verified.Status == "conflict" {
 		report.Status = "conflict"
 		for _, check := range verified.Checks {
@@ -70,6 +90,75 @@ func Solve(req domain.SolveRequest) domain.Report {
 		}
 	}
 	return report
+}
+
+func markGoalsUnmet(statuses []domain.GoalStatus, reason string) []domain.GoalStatus {
+	for i := range statuses {
+		if statuses[i].Status == "pending" {
+			statuses[i].Status = "unmet"
+			statuses[i].Reason = reason
+		}
+	}
+	return statuses
+}
+
+func normalizedGoals(req domain.SolveRequest) []domain.MigrationGoal {
+	goals := append([]domain.MigrationGoal{}, req.Goals...)
+	if req.Target != "" && req.DesiredVersion != "" {
+		found := false
+		for _, goal := range goals {
+			if goal.Component == req.Target && goal.Version == req.DesiredVersion {
+				found = true
+			}
+		}
+		if !found {
+			goals = append(goals, domain.MigrationGoal{Component: req.Target, Version: req.DesiredVersion})
+		}
+	}
+	sort.SliceStable(goals, func(i, j int) bool {
+		if goals[i].Component == goals[j].Component {
+			return goals[i].Version < goals[j].Version
+		}
+		return goals[i].Component < goals[j].Component
+	})
+	return goals
+}
+
+func conflictingGoals(goals []domain.MigrationGoal) *domain.MigrationGoal {
+	versionsByComponent := map[string]string{}
+	for _, goal := range goals {
+		if previous, exists := versionsByComponent[goal.Component]; exists && previous != goal.Version {
+			return &goal
+		}
+		versionsByComponent[goal.Component] = goal.Version
+	}
+	return nil
+}
+
+func goalVersions(goals []domain.MigrationGoal, component string) []string {
+	out := []string{}
+	for _, goal := range goals {
+		if goal.Component == component {
+			out = append(out, goal.Version)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func mergeConfirmedLocks(req *domain.SolveRequest) {
+	if len(req.Confirmed) == 0 {
+		return
+	}
+	if req.Locks == nil {
+		req.Locks = map[string]string{}
+	}
+	for name, version := range req.Confirmed {
+		if existing, exists := req.Locks[name]; exists && existing != version {
+			continue
+		}
+		req.Locks[name] = version
+	}
 }
 
 func (s *state) versionExists(name, version string) bool {
@@ -101,6 +190,16 @@ func validate(req domain.SolveRequest) error {
 			return fmt.Errorf("locked version for %s: %w", name, err)
 		}
 	}
+	for _, goal := range req.Goals {
+		if _, err := semver.Parse(goal.Version); err != nil {
+			return fmt.Errorf("target version for %s: %w", goal.Component, err)
+		}
+	}
+	for name, version := range req.Confirmed {
+		if _, err := semver.Parse(version); err != nil {
+			return fmt.Errorf("confirmed version for %s: %w", name, err)
+		}
+	}
 	return nil
 }
 
@@ -112,6 +211,7 @@ func newState(req domain.SolveRequest) *state {
 		assignment:      map[string]string{},
 		edges:           map[string][]edge{},
 		required:        map[string]bool{},
+		roots:           map[string]bool{},
 		optionalOmitted: map[string]bool{},
 	}
 	for _, component := range req.Manifest.Components {
@@ -324,7 +424,7 @@ func (s *state) pathFor(destination string) []domain.ChainLink {
 	outgoing := map[string][]domain.ChainLink{}
 	for _, items := range s.edges {
 		for _, item := range items {
-			if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+			if isRootPseudoNode(item.link.From) {
 				continue
 			}
 			outgoing[item.link.From] = append(outgoing[item.link.From], item.link)
@@ -333,7 +433,7 @@ func (s *state) pathFor(destination string) []domain.ChainLink {
 	roots := make([]string, 0, len(s.edges))
 	for name, items := range s.edges {
 		for _, item := range items {
-			if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+			if isRootPseudoNode(item.link.From) {
 				roots = append(roots, name)
 				break
 			}
@@ -375,7 +475,7 @@ func (s *state) fullChainFor(bad domain.ChainLink) []domain.ChainLink {
 	// Prefer a path ending exactly at the bad edge; if the BFS path already
 	// contains the bad requirement drop its tail and re-append the bad edge.
 	chain = appendChainEnding(chain, bad)
-	if from := bad.From; from != "upgrade request" && from != "manual lock" {
+	if from := bad.From; !isRootPseudoNode(from) {
 		if root := s.rootEdgeFor(from); root != nil {
 			chain = append([]domain.ChainLink{*root}, chain...)
 		}
@@ -388,12 +488,16 @@ func (s *state) fullChainFor(bad domain.ChainLink) []domain.ChainLink {
 
 func (s *state) rootEdgeFor(component string) *domain.ChainLink {
 	for _, item := range s.edges[component] {
-		if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+		if isRootPseudoNode(item.link.From) {
 			link := item.link
 			return &link
 		}
 	}
 	return nil
+}
+
+func isRootPseudoNode(name string) bool {
+	return name == "migration goal" || name == "upgrade request" || name == "confirmed selection" || name == "manual lock"
 }
 
 func appendChainEnding(path []domain.ChainLink, bad domain.ChainLink) []domain.ChainLink {

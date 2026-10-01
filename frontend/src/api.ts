@@ -12,5 +12,5 @@ export const loadSample = (id: string) => request<Scenario>(`/api/sample?id=${en
 export const solve = (payload: SolveRequest) => request<Report>('/api/solve', { method: 'POST', body: JSON.stringify(payload) })
 export const savePlan = (payload: SolveRequest) => request<Plan>('/api/plans', { method: 'POST', body: JSON.stringify(payload) })
 export const listPlans = () => request<Plan[]>('/api/plans')
-export const verify = (manifest: Manifest, selection: Record<string, string>) =>
-  request<Report>('/api/plans/verify', { method: 'POST', body: JSON.stringify({ manifest, selection }) })
+export const verify = (payload: SolveRequest, selection: Record<string, string>) =>
+  request<Report>('/api/plans/verify', { method: 'POST', body: JSON.stringify({ ...payload, selection }) })

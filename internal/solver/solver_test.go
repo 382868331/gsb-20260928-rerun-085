@@ -80,7 +80,7 @@ func TestIndependentVerifierWarnsOnCycles(t *testing.T) {
 		{Name: "a", Versions: []domain.Version{{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "b", Constraint: "^1.0.0"}}}}},
 		{Name: "b", Versions: []domain.Version{{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "a", Constraint: "^1.0.0"}}}}},
 	}}
-	report := verifier.Verify(manifest, map[string]string{"a": "1.0.0", "b": "1.0.0"})
+	report := verifier.VerifyRequest(domain.SolveRequest{Manifest: manifest, Target: "a", DesiredVersion: "1.0.0"}, map[string]string{"a": "1.0.0", "b": "1.0.0"})
 	if report.Status != "feasible" {
 		t.Fatalf("cycles should be warnings, got %s", report.Status)
 	}

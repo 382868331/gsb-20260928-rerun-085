@@ -8,13 +8,17 @@ export type SolveRequest = {
   target: string
   desiredVersion: string
   locks?: Record<string, string>
+  goals?: Array<{ component: string; version: string }>
+  confirmed?: Record<string, string>
 }
+export type GoalStatus = { component: string; required: string; selected?: string; status: 'satisfied' | 'pending' | 'unmet' | string; reason?: string }
 export type ChainLink = { from: string; fromVersion?: string; to: string; constraint: string; optional?: boolean }
 export type Change = { component: string; from: string; to: string; reason: string }
 export type Check = { kind: string; status: string; message: string; chain?: ChainLink[] }
 export type Report = {
   status: 'feasible' | 'conflict' | string
   selection: Record<string, string>
+  goalStatuses?: GoalStatus[]
   changes: Change[]
   changedCount: number
   conflictChain?: ChainLink[]
