@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -65,6 +66,13 @@ func (s *Server) handleSolve(w http.ResponseWriter, r *http.Request) {
 type verifyRequest struct {
 	Manifest  domain.Manifest   `json:"manifest"`
 	Selection map[string]string `json:"selection"`
+	// Optional goal fields. When any of them is present the verifier also
+	// checks that the selection actually covers the migration objectives, so
+	// an empty or unrelated selection can no longer pass as feasible.
+	Target         string            `json:"target,omitempty"`
+	DesiredVersion string            `json:"desiredVersion,omitempty"`
+	Locks          map[string]string `json:"locks,omitempty"`
+	Adopted        map[string]string `json:"adopted,omitempty"`
 }
 
 func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +89,13 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if selection == nil {
 		selection = map[string]string{}
 	}
-	writeJSON(w, http.StatusOK, verifier.Verify(payload.Manifest, selection))
+	goals := domain.SolveRequest{
+		Target:         payload.Target,
+		DesiredVersion: payload.DesiredVersion,
+		Locks:          payload.Locks,
+		Adopted:        payload.Adopted,
+	}.Goals()
+	writeJSON(w, http.StatusOK, verifier.VerifyWithGoals(payload.Manifest, selection, goals))
 }
 
 func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
@@ -92,6 +106,12 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		// Never serve a borrowed conclusion: every plan is re-verified
+		// against its own frozen snapshot each time it is read back, even
+		// after a restart or a duplicate submission.
+		for i := range plans {
+			plans[i] = reverify(plans[i])
+		}
 		writeJSON(w, http.StatusOK, plans)
 	case http.MethodPost:
 		var req domain.SolveRequest
@@ -100,17 +120,14 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		report := solver.Solve(req)
-		// Independent re-check against the exact manifest snapshot carried in
-		// the request. The solver status is deliberately not trusted.
-		verification := verifier.Verify(req.Manifest, report.Selection)
 		plan := domain.Plan{
 			ID:           newID(),
 			Request:      req,
 			Report:       report,
-			Verification: verification,
-			Consistent:   consistent(report, verification),
+			ManifestHash: manifestHash(req.Manifest),
 			CreatedAt:    time.Now().UTC().Format(time.RFC3339),
 		}
+		plan = reverify(plan)
 		if err := s.store.Save(plan); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -119,6 +136,28 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "GET or POST required")
 	}
+}
+
+// reverify recomputes the independent verification from the plan's own
+// request snapshot (manifest, goals and selection). Stored conclusions are
+// treated as untrusted input so a plan can never inherit a success verdict
+// produced for a different manifest revision or a different set of goals.
+func reverify(plan domain.Plan) domain.Plan {
+	plan.Verification = verifier.VerifyWithGoals(plan.Request.Manifest, plan.Report.Selection, plan.Request.Goals())
+	if plan.ManifestHash == "" {
+		plan.ManifestHash = manifestHash(plan.Request.Manifest)
+	}
+	plan.Consistent = consistent(plan.Report, plan.Verification)
+	return plan
+}
+
+func manifestHash(manifest domain.Manifest) string {
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {

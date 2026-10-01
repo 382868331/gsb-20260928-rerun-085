@@ -8,7 +8,18 @@ import (
 	"dependency-workbench/internal/semver"
 )
 
+// Verify checks a selection for internal consistency only. Prefer
+// VerifyWithGoals whenever the migration objectives are known: a selection
+// that simply avoids conflicts (including the empty selection) must not be
+// reported as a feasible migration on its own.
 func Verify(manifest domain.Manifest, selection map[string]string) domain.Report {
+	return VerifyWithGoals(manifest, selection, nil)
+}
+
+// VerifyWithGoals independently re-checks the selection against the manifest
+// and against the requested goals. Missing or contradictory goal coverage is
+// reported with a specific reason instead of defaulting to success.
+func VerifyWithGoals(manifest domain.Manifest, selection map[string]string, goals []domain.Goal) domain.Report {
 	versions := map[string]map[string]domain.Version{}
 	for _, component := range manifest.Components {
 		versions[component.Name] = map[string]domain.Version{}
@@ -17,6 +28,28 @@ func Verify(manifest domain.Manifest, selection map[string]string) domain.Report
 		}
 	}
 	checks := []domain.Check{}
+	goalStatuses := []domain.GoalStatus{}
+	for _, goal := range goals {
+		status := domain.GoalStatus{Goal: goal, Status: "satisfied"}
+		chosen, included := selection[goal.Component]
+		switch {
+		case !included:
+			checks = append(checks, domain.Check{Kind: "goal", Status: "error", Message: fmt.Sprintf("%s goal %s %s is not covered by the selection", goal.Source, goal.Component, goal.Desired)})
+			status.Status = "unsatisfiable"
+			status.Detail = "missing from selection"
+		case chosen != goal.Desired:
+			checks = append(checks, domain.Check{Kind: "goal", Status: "error", Message: fmt.Sprintf("%s goal %s %s contradicts selected version %s", goal.Source, goal.Component, goal.Desired, chosen)})
+			status.Status = "unsatisfiable"
+			status.Detail = "selected " + chosen
+		default:
+			if _, ok := versions[goal.Component][goal.Desired]; !ok {
+				checks = append(checks, domain.Check{Kind: "goal", Status: "error", Message: fmt.Sprintf("%s goal %s %s does not exist in the manifest", goal.Source, goal.Component, goal.Desired)})
+				status.Status = "unsatisfiable"
+				status.Detail = "unknown version"
+			}
+		}
+		goalStatuses = append(goalStatuses, status)
+	}
 	selectedComponents := make([]string, 0, len(selection))
 	for name := range selection {
 		selectedComponents = append(selectedComponents, name)
@@ -63,7 +96,7 @@ func Verify(manifest domain.Manifest, selection map[string]string) domain.Report
 			break
 		}
 	}
-	return domain.Report{Status: status, Selection: clone(selection), Changes: []domain.Change{}, Checks: checks}
+	return domain.Report{Status: status, Selection: clone(selection), Changes: []domain.Change{}, Checks: checks, Goals: goalStatuses}
 }
 
 func findCycles(manifest domain.Manifest, selection map[string]string) [][]domain.ChainLink {

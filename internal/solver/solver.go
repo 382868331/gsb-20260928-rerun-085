@@ -17,6 +17,7 @@ type edge struct {
 type state struct {
 	current             map[string]string
 	locks               map[string]string
+	adopted             map[string]string
 	versions            map[string][]domain.Version
 	assignment          map[string]string
 	edges               map[string][]edge
@@ -42,6 +43,11 @@ func Solve(req domain.SolveRequest) domain.Report {
 			return fail(fmt.Sprintf("locked version %s %s does not exist in the manifest", name, version), nil)
 		}
 	}
+	for name, version := range req.Adopted {
+		if !s.versionExists(name, version) {
+			return fail(fmt.Sprintf("adopted version %s %s does not exist in the manifest", name, version), nil)
+		}
+	}
 	s.required[req.Target] = true
 	s.assign(req.Target, req.DesiredVersion)
 	s.edges[req.Target] = []edge{{link: domain.ChainLink{From: "upgrade request", To: req.Target, Constraint: "=" + req.DesiredVersion}}}
@@ -50,15 +56,23 @@ func Solve(req domain.SolveRequest) domain.Report {
 		s.assign(name, version)
 		s.edges[name] = append(s.edges[name], edge{link: domain.ChainLink{From: "manual lock", To: name, Constraint: "=" + version}})
 	}
+	for name, version := range req.Adopted {
+		s.required[name] = true
+		s.assign(name, version)
+		s.edges[name] = append(s.edges[name], edge{link: domain.ChainLink{From: "adopted component", To: name, Constraint: "=" + version}})
+	}
 	s.bestCount = len(req.Current) + 1
 	s.bestMovement = int(^uint(0) >> 1)
 	best, changes, ok := s.search()
 	if !ok {
-		return fail(s.conflictMessage, s.conflictChain)
+		report := fail(s.conflictMessage, s.conflictChain)
+		report.Goals = goalStatusesOnConflict(req, s.conflictChain)
+		return report
 	}
 	report := buildReport(req, best, changes, s)
-	verified := verifier.Verify(req.Manifest, report.Selection)
+	verified := verifier.VerifyWithGoals(req.Manifest, report.Selection, req.Goals())
 	report.Checks = verified.Checks
+	report.Goals = verified.Goals
 	if verified.Status == "conflict" {
 		report.Status = "conflict"
 		for _, check := range verified.Checks {
@@ -70,6 +84,28 @@ func Solve(req domain.SolveRequest) domain.Report {
 		}
 	}
 	return report
+}
+
+// goalStatusesOnConflict classifies the request goals when no compatible
+// combination exists: goals participating in the conflict chain are
+// unsatisfiable, the rest stay pending until a compatible combination is
+// found for them.
+func goalStatusesOnConflict(req domain.SolveRequest, chain []domain.ChainLink) []domain.GoalStatus {
+	involved := map[string]bool{}
+	for _, link := range chain {
+		involved[link.To] = true
+		involved[link.From] = true
+	}
+	out := []domain.GoalStatus{}
+	for _, goal := range req.Goals() {
+		status := domain.GoalStatus{Goal: goal, Status: "pending", Detail: "no compatible combination yet"}
+		if involved[goal.Component] {
+			status.Status = "unsatisfiable"
+			status.Detail = "participates in the conflict"
+		}
+		out = append(out, status)
+	}
+	return out
 }
 
 func (s *state) versionExists(name, version string) bool {
@@ -101,6 +137,11 @@ func validate(req domain.SolveRequest) error {
 			return fmt.Errorf("locked version for %s: %w", name, err)
 		}
 	}
+	for name, version := range req.Adopted {
+		if _, err := semver.Parse(version); err != nil {
+			return fmt.Errorf("adopted version for %s: %w", name, err)
+		}
+	}
 	return nil
 }
 
@@ -108,6 +149,7 @@ func newState(req domain.SolveRequest) *state {
 	s := &state{
 		current:         req.Current,
 		locks:           req.Locks,
+		adopted:         req.Adopted,
 		versions:        map[string][]domain.Version{},
 		assignment:      map[string]string{},
 		edges:           map[string][]edge{},
@@ -221,6 +263,9 @@ func (s *state) domain(name string) ([]domain.Version, []domain.ChainLink, strin
 
 func (s *state) order(name string, candidates []domain.Version) []domain.Version {
 	locked := s.locks[name]
+	if locked == "" {
+		locked = s.adopted[name]
+	}
 	sort.SliceStable(candidates, func(i, j int) bool {
 		a, b := candidates[i].Version, candidates[j].Version
 		if locked != "" {
@@ -324,7 +369,7 @@ func (s *state) pathFor(destination string) []domain.ChainLink {
 	outgoing := map[string][]domain.ChainLink{}
 	for _, items := range s.edges {
 		for _, item := range items {
-			if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+			if isPseudoEdge(item.link.From) {
 				continue
 			}
 			outgoing[item.link.From] = append(outgoing[item.link.From], item.link)
@@ -333,7 +378,7 @@ func (s *state) pathFor(destination string) []domain.ChainLink {
 	roots := make([]string, 0, len(s.edges))
 	for name, items := range s.edges {
 		for _, item := range items {
-			if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+			if isPseudoEdge(item.link.From) {
 				roots = append(roots, name)
 				break
 			}
@@ -375,7 +420,7 @@ func (s *state) fullChainFor(bad domain.ChainLink) []domain.ChainLink {
 	// Prefer a path ending exactly at the bad edge; if the BFS path already
 	// contains the bad requirement drop its tail and re-append the bad edge.
 	chain = appendChainEnding(chain, bad)
-	if from := bad.From; from != "upgrade request" && from != "manual lock" {
+	if from := bad.From; !isPseudoEdge(from) {
 		if root := s.rootEdgeFor(from); root != nil {
 			chain = append([]domain.ChainLink{*root}, chain...)
 		}
@@ -388,12 +433,16 @@ func (s *state) fullChainFor(bad domain.ChainLink) []domain.ChainLink {
 
 func (s *state) rootEdgeFor(component string) *domain.ChainLink {
 	for _, item := range s.edges[component] {
-		if item.link.From == "upgrade request" || item.link.From == "manual lock" {
+		if isPseudoEdge(item.link.From) {
 			link := item.link
 			return &link
 		}
 	}
 	return nil
+}
+
+func isPseudoEdge(from string) bool {
+	return from == "upgrade request" || from == "manual lock" || from == "adopted component"
 }
 
 func appendChainEnding(path []domain.ChainLink, bad domain.ChainLink) []domain.ChainLink {
@@ -420,6 +469,8 @@ func buildReport(req domain.SolveRequest, selection map[string]string, changes [
 			changes[i].Reason = "requested upgrade"
 		case s.locks[changes[i].Component] != "":
 			changes[i].Reason = "manual lock"
+		case s.adopted[changes[i].Component] != "":
+			changes[i].Reason = "adopted component"
 		case len(s.edges[changes[i].Component]) > 0:
 			item := s.edges[changes[i].Component][0]
 			changes[i].Reason = "required by " + item.link.From + " " + item.link.FromVersion + " (" + item.link.Constraint + ")"

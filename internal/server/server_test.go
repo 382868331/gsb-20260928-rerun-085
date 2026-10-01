@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -255,4 +256,104 @@ func encodeDecode[T any](t *testing.T, value any) T {
 
 func contains(haystack, needle string) bool {
 	return bytes.Contains([]byte(haystack), []byte(needle))
+}
+
+// An empty selection must no longer be judged feasible when the verification
+// request carries the migration goals.
+func TestVerifyWithGoalsRejectsEmptySelection(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "base")
+	_, verified := do(t, handler, http.MethodPost, "/api/plans/verify", map[string]any{
+		"manifest":       req.Manifest,
+		"selection":      map[string]string{},
+		"target":         req.Target,
+		"desiredVersion": req.DesiredVersion,
+	})
+	if got, _ := verified["status"].(string); got != "conflict" {
+		t.Fatalf("empty selection with goals must conflict, got %v", verified)
+	}
+	checks, _ := verified["checks"].([]any)
+	foundGoal := false
+	for _, item := range checks {
+		check, _ := item.(map[string]any)
+		if check["kind"] == "goal" {
+			foundGoal = true
+		}
+	}
+	if !foundGoal {
+		t.Fatalf("expected a goal-specific reason, got %v", checks)
+	}
+}
+
+// Submitting the same request twice must produce two plans whose conclusions
+// are each computed from their own snapshot, not copied from the first save.
+func TestDuplicateSubmissionVerifiedIndependently(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "base")
+	_, first := do(t, handler, http.MethodPost, "/api/plans", req)
+	_, second := do(t, handler, http.MethodPost, "/api/plans", req)
+	if first["id"] == second["id"] {
+		t.Fatal("duplicate submission must create a distinct plan")
+	}
+	for _, saved := range []map[string]any{first, second} {
+		if ok, _ := saved["consistent"].(bool); !ok {
+			t.Fatalf("each saved plan must be independently consistent: %v", saved)
+		}
+		verification := encodeDecode[domain.Report](t, saved["verification"])
+		if verification.Status != "feasible" || len(verification.Goals) == 0 {
+			t.Fatalf("verification must be goal-aware, got %#v", verification)
+		}
+	}
+	if first["manifestHash"] == "" || first["manifestHash"] != second["manifestHash"] {
+		t.Fatalf("same manifest must share a hash, got %v / %v", first["manifestHash"], second["manifestHash"])
+	}
+}
+
+// A stored success conclusion must never be borrowed: even if the persisted
+// file claims feasibility, listing re-verifies against the frozen snapshot.
+func TestStoredConclusionIsRecomputedOnRead(t *testing.T) {
+	dir := t.TempDir()
+	planStore, err := store.New(filepath.Join(dir, "plans.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := server.New(planStore, nil)
+	req := scenario(t, handler, "lock-conflict")
+	status, saved := do(t, handler, http.MethodPost, "/api/plans", req)
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d: %v", status, saved)
+	}
+	// Tamper with the stored file: pretend the solver found a feasible plan.
+	content, err := os.ReadFile(filepath.Join(dir, "plans.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plans []map[string]any
+	if err := json.Unmarshal(content, &plans); err != nil {
+		t.Fatal(err)
+	}
+	plans[0]["report"] = map[string]any{"status": "feasible", "selection": map[string]string{"app": "2.0.0", "lib": "3.0.0"}, "changes": []any{}, "checks": []any{}}
+	plans[0]["verification"] = map[string]any{"status": "feasible", "selection": map[string]string{"app": "2.0.0", "lib": "3.0.0"}, "checks": []any{}}
+	plans[0]["consistent"] = true
+	encoded, _ := json.Marshal(plans)
+	if err := os.WriteFile(filepath.Join(dir, "plans.json"), encoded, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	listReq := httptest.NewRequest(http.MethodGet, "/api/plans", nil)
+	listRec := httptest.NewRecorder()
+	handler.ServeHTTP(listRec, listReq)
+	var got []map[string]any
+	if err := json.Unmarshal(listRec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected one plan, got %d", len(got))
+	}
+	verification := encodeDecode[domain.Report](t, got[0]["verification"])
+	if verification.Status != "conflict" {
+		t.Fatalf("stored feasible verdict must not survive re-verification, got %s", verification.Status)
+	}
+	if ok, _ := got[0]["consistent"].(bool); ok {
+		t.Fatal("tampered plan must not be reported consistent")
+	}
 }

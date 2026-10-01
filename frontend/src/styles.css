@@ -52,3 +52,6 @@ th { color: #60708a; font-size: 12px; text-transform: uppercase; letter-spacing:
 .saved { margin-top: 18px; }
 .saved button { padding: 7px 10px; font-size: 13px; }
 @media (max-width: 980px) { .grid, .result-grid { grid-template-columns: 1fr; } textarea { min-height: 360px; } header { align-items: flex-start; flex-direction: column; } }
+.pick { display: block; margin: 4px 0; font-size: 13px; }
+.pick input { margin-right: 6px; }
+.goals { list-style: none; padding-left: 0; }

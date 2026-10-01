@@ -8,7 +8,10 @@ export type SolveRequest = {
   target: string
   desiredVersion: string
   locks?: Record<string, string>
+  adopted?: Record<string, string>
 }
+export type Goal = { component: string; desired: string; source: 'target' | 'lock' | 'adopted' | string }
+export type GoalStatus = { goal: Goal; status: 'satisfied' | 'pending' | 'unsatisfiable' | string; detail?: string }
 export type ChainLink = { from: string; fromVersion?: string; to: string; constraint: string; optional?: boolean }
 export type Change = { component: string; from: string; to: string; reason: string }
 export type Check = { kind: string; status: string; message: string; chain?: ChainLink[] }
@@ -21,6 +24,7 @@ export type Report = {
   conflictMessage?: string
   checks: Check[]
   optionalOmitted?: string[]
+  goals?: GoalStatus[]
 }
 export type Scenario = {
   id: string
@@ -34,5 +38,6 @@ export type Plan = {
   report: Report
   verification: Report
   consistent: boolean
+  manifestHash?: string
   createdAt: string
 }

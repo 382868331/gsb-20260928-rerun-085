@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { listPlans, loadSample, loadScenarios, savePlan, solve, verify } from './api'
 import { Chain } from './Chain'
-import type { Plan, Report, Scenario, SolveRequest } from './types'
+import type { GoalStatus, Plan, Report, Scenario, SolveRequest } from './types'
 
 const EMPTY: SolveRequest = { manifest: { components: [] }, current: {}, target: '', desiredVersion: '', locks: {} }
 
@@ -14,6 +14,7 @@ export default function App() {
   const [report, setReport] = useState<Report | null>(null)
   const [savedReport, setSavedReport] = useState<Report | null>(null)
   const [independentReport, setIndependentReport] = useState<Report | null>(null)
+  const [picked, setPicked] = useState<Record<string, boolean>>({})
   const [comparisons, setComparisons] = useState<{ label: string; locks: Record<string, string>; report: Report }[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
   const [error, setError] = useState('')
@@ -38,8 +39,18 @@ export default function App() {
     setReport(null)
     setSavedReport(null)
     setIndependentReport(null)
+    setPicked({})
     setComparisons([])
     setError('')
+  }
+
+  // Editing any input invalidates every conclusion on the page: a verdict is
+  // only ever shown for the exact data it was computed from.
+  function clearResults() {
+    setReport(null)
+    setSavedReport(null)
+    setIndependentReport(null)
+    setPicked({})
   }
 
   function refreshPlans() {
@@ -79,13 +90,37 @@ export default function App() {
         await refreshPlans()
       }
       if (action === 'verify' && report) {
-        setIndependentReport(await verify(payload.manifest, report.selection))
+        setIndependentReport(await verify(payload, report.selection))
       }
       if (action === 'compare') {
         const result = await solve(payload)
         const label = `锁定 ${Object.entries(payload.locks ?? {}).map(([name, version]) => `${name}@${version}`).join('、') || '无锁定'}`
         setComparisons((items) => [...items.filter((item) => item.label !== label), { label, locks: payload.locks ?? {}, report: result }])
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function adoptAndContinue() {
+    if (!report) return
+    const adopted = { ...(draft.adopted ?? {}) }
+    for (const [name, version] of Object.entries(report.selection)) {
+      if (picked[name]) adopted[name] = version
+    }
+    if (Object.keys(adopted).length === 0) return
+    setBusy(true)
+    setError('')
+    try {
+      const payload = { ...currentPayload(), adopted }
+      setDraft(payload)
+      const result = await solve(payload)
+      setReport(result)
+      setSavedReport(null)
+      setIndependentReport(null)
+      setPicked({})
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -121,22 +156,22 @@ export default function App() {
         <div className="card">
           <h2>本地虚构版本资料</h2>
           <p className="hint">输入 manifest 和 current；后续真实包管理器格式可在此处增加适配层。</p>
-          <textarea value={jsonText} onChange={(event) => setJsonText(event.target.value)} spellCheck={false} />
+          <textarea value={jsonText} onChange={(event) => { setJsonText(event.target.value); clearResults() }} spellCheck={false} />
         </div>
 
         <div className="card">
           <h2>升级选择与锁定</h2>
           <label>升级组件
-            <input value={draft.target} onChange={(event) => setDraft({ ...draft, target: event.target.value })} />
+            <input value={draft.target} onChange={(event) => { setDraft({ ...draft, target: event.target.value }); clearResults() }} />
           </label>
           <label>目标版本
-            <select value={draft.desiredVersion} onChange={(event) => setDraft({ ...draft, desiredVersion: event.target.value })}>
+            <select value={draft.desiredVersion} onChange={(event) => { setDraft({ ...draft, desiredVersion: event.target.value }); clearResults() }}>
               <option value="">请选择</option>
               {targetVersions.map((version) => <option key={version} value={version}>{version}</option>)}
             </select>
           </label>
           <label>锁定组件版本（JSON）
-            <textarea className="small" value={locksText} onChange={(event) => setLocksText(event.target.value)} spellCheck={false} />
+            <textarea className="small" value={locksText} onChange={(event) => { setLocksText(event.target.value); clearResults() }} spellCheck={false} />
           </label>
           <div className="actions">
             <button onClick={() => void run('solve')} disabled={busy} className="primary">求解 / 重算</button>
@@ -146,14 +181,25 @@ export default function App() {
         </div>
       </section>
 
-      {report ? <Result report={report} saved={savedReport} independent={independentReport} /> : null}
+      {report ? (
+        <Result
+          report={report}
+          saved={savedReport}
+          independent={independentReport}
+          picked={picked}
+          onPick={(name, on) => setPicked((prev) => ({ ...prev, [name]: on }))}
+          onAdopt={() => void adoptAndContinue()}
+          busy={busy}
+          adopted={draft.adopted ?? {}}
+        />
+      ) : null}
 
       {comparisons.length > 0 ? <Comparison items={comparisons} /> : null}
 
       <SavedPlans
         plans={plans}
         onReverify={async (plan) => {
-          const result = await verify(plan.request.manifest, plan.report.selection)
+          const result = await verify(plan.request, plan.report.selection)
           setPlans((items) => items.map((item) => item.id === plan.id ? { ...item, verification: result, consistent: plan.report.status === result.status } : item))
           return result
         }}
@@ -205,7 +251,7 @@ function SavedPlans({ plans, onReverify }: { plans: Plan[]; onReverify: (plan: P
             {[...plans].reverse().map((plan) => (
               <tr key={plan.id}>
                 <td>{plan.createdAt}</td>
-                <td>{plan.request.target} @ {plan.request.desiredVersion}</td>
+                <td>{plan.request.target} @ {plan.request.desiredVersion}{plan.manifestHash ? <span className="hint">（资料 {plan.manifestHash.slice(0, 8)}）</span> : null}</td>
                 <td className={plan.report.status === 'feasible' ? 'success-text' : 'error-text'}>{plan.report.status}</td>
                 <td className={plan.verification.status === 'feasible' ? 'success-text' : 'error-text'}>
                   {plan.verification.status}
@@ -227,7 +273,33 @@ function SavedPlans({ plans, onReverify }: { plans: Plan[]; onReverify: (plan: P
   )
 }
 
-function Result({ report, saved, independent }: { report: Report; saved: Report | null; independent: Report | null }) {
+const GOAL_LABEL: Record<string, string> = { satisfied: '已满足', pending: '待补齐', unsatisfiable: '无法满足' }
+const GOAL_SOURCE: Record<string, string> = { target: '升级目标', lock: '手动锁定', adopted: '已确认组件' }
+
+function GoalList({ goals }: { goals?: GoalStatus[] }) {
+  if (!goals || goals.length === 0) return null
+  return (
+    <ul className="compact goals">
+      {goals.map((item) => (
+        <li key={item.goal.source + item.goal.component} className={item.status === 'satisfied' ? 'success-text' : item.status === 'unsatisfiable' ? 'error-text' : 'warning-text'}>
+          {GOAL_SOURCE[item.goal.source] ?? item.goal.source} {item.goal.component}@{item.goal.desired}：{GOAL_LABEL[item.status] ?? item.status}
+          {item.detail ? <span className="hint">（{item.detail}）</span> : null}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function Result({ report, saved, independent, picked, onPick, onAdopt, busy, adopted }: {
+  report: Report
+  saved: Report | null
+  independent: Report | null
+  picked: Record<string, boolean>
+  onPick: (name: string, on: boolean) => void
+  onAdopt: () => void
+  busy: boolean
+  adopted: Record<string, string>
+}) {
   const consistency = saved && independent
     ? saved.status === independent.status && JSON.stringify(Object.entries(saved.selection).sort()) === JSON.stringify(Object.entries(independent.selection).sort())
     : null
@@ -238,6 +310,7 @@ function Result({ report, saved, independent }: { report: Report; saved: Report 
         <h2>{report.status === 'feasible' ? '方案可满足' : '存在冲突'}</h2>
         {report.conflictMessage ? <p>{report.conflictMessage}</p> : <p>共需调整 {report.changedCount} 个组件。</p>}
         <Chain links={report.conflictChain} />
+        <GoalList goals={report.goals} />
       </div>
 
       <div className="card">
@@ -258,6 +331,21 @@ function Result({ report, saved, independent }: { report: Report; saved: Report 
         <div className="selection">
           {Object.entries(report.selection).sort().map(([name, version]) => <span key={name}>{name + '@' + version}</span>)}
         </div>
+        {report.status === 'feasible' ? (
+          <>
+            <h3>部分采纳</h3>
+            <p className="hint">勾选已确认的组件后继续求解：它们会被锁定，只为剩余目标寻找兼容组合。</p>
+            {Object.entries(report.selection).sort().map(([name, version]) => (
+              <label key={name} className="pick">
+                <input type="checkbox" checked={!!picked[name]} onChange={(event) => onPick(name, event.target.checked)} />
+                {name}@{version}{adopted[name] ? '（已确认）' : ''}
+              </label>
+            ))}
+            <div className="actions">
+              <button onClick={onAdopt} disabled={busy || !Object.values(picked).some(Boolean)}>采纳选中并继续求解</button>
+            </div>
+          </>
+        ) : null}
       </div>
 
       <div className="card">
