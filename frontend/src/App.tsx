@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { listPlans, loadSample, loadScenarios, savePlan, solve, verify } from './api'
+import { listPlans, listRoutes, loadSample, loadScenarios, planRoute, savePlan, saveRoute, solve, verify } from './api'
 import { Chain } from './Chain'
-import type { Plan, Report, Scenario, SolveRequest } from './types'
+import type { Plan, Report, RouteReport, RouteStep, SavedRoute, Scenario, SolveRequest } from './types'
 
 const EMPTY: SolveRequest = { manifest: { components: [] }, current: {}, target: '', desiredVersion: '', locks: {} }
 
@@ -16,6 +16,9 @@ export default function App() {
   const [independentReport, setIndependentReport] = useState<Report | null>(null)
   const [comparisons, setComparisons] = useState<{ label: string; locks: Record<string, string>; report: Report }[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
+  const [confirmedSteps, setConfirmedSteps] = useState<RouteStep[]>([])
+  const [route, setRoute] = useState<RouteReport | null>(null)
+  const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -26,6 +29,7 @@ export default function App() {
         return applyScenario(items[0]?.id ?? 'base')
       })
       .then(() => refreshPlans())
+      .then(() => refreshRoutes())
       .catch((err) => setError(String(err)))
   }, [])
 
@@ -39,11 +43,17 @@ export default function App() {
     setSavedReport(null)
     setIndependentReport(null)
     setComparisons([])
+    setConfirmedSteps([])
+    setRoute(null)
     setError('')
   }
 
   function refreshPlans() {
     return listPlans().then(setPlans).catch((err) => setError(String(err)))
+  }
+
+  function refreshRoutes() {
+    return listRoutes().then(setSavedRoutes).catch((err) => setError(String(err)))
   }
 
   const targetVersions = useMemo(() => {
@@ -86,6 +96,34 @@ export default function App() {
         const label = `锁定 ${Object.entries(payload.locks ?? {}).map(([name, version]) => `${name}@${version}`).join('、') || '无锁定'}`
         setComparisons((items) => [...items.filter((item) => item.label !== label), { label, locks: payload.locks ?? {}, report: result }])
       }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function runRoute(action: 'plan' | 'save' | 'confirm') {
+    setBusy(true)
+    setError('')
+    try {
+      const payload = currentPayload()
+      const confirmed = action === 'confirm' && route && route.steps.length > 0
+        ? [...confirmedSteps, { ...route.steps[0], confirmed: true }]
+        : confirmedSteps
+      const request = {
+        manifest: payload.manifest,
+        current: payload.current,
+        target: payload.target,
+        desiredVersion: payload.desiredVersion,
+        goals: payload.goals,
+        locks: payload.locks,
+        confirmed,
+      }
+      const result = action === 'save' ? (await saveRoute(request)).report : await planRoute(request)
+      setConfirmedSteps(confirmed)
+      setRoute(result)
+      if (action === 'save') await refreshRoutes()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -148,7 +186,24 @@ export default function App() {
 
       {report ? <Result report={report} saved={savedReport} independent={independentReport} /> : null}
 
+      <section className="card route-panel">
+        <h2>分阶段升级路线</h2>
+        <p className="hint">
+          每个中间状态都经过独立核验；单步不允许跨多个大版本，必要时会安排过渡版本。
+          {confirmedSteps.length > 0 ? '已确认的步骤保持原样，可修改目标或锁定后从已完成状态继续规划。' : '确认前几步后，可修改最终目标或锁定未升级组件，再从已完成状态继续。'}
+        </p>
+        <div className="actions">
+          <button onClick={() => void runRoute('plan')} disabled={busy} className="primary">{confirmedSteps.length > 0 ? '从已完成状态继续规划' : '规划分阶段路线'}</button>
+          <button onClick={() => void runRoute('confirm')} disabled={busy || !route || route.status !== 'feasible' || route.steps.length === 0}>确认下一步</button>
+          <button onClick={() => void runRoute('save')} disabled={busy || !route}>保存路线</button>
+          {confirmedSteps.length > 0 ? <button onClick={() => { setConfirmedSteps([]); setRoute(null) }} disabled={busy}>放弃已确认步骤</button> : null}
+        </div>
+        {route ? <RouteResult route={route} confirmedCount={confirmedSteps.length} /> : null}
+      </section>
+
       {comparisons.length > 0 ? <Comparison items={comparisons} /> : null}
+
+      <SavedRoutes routes={savedRoutes} />
 
       <SavedPlans
         plans={plans}
@@ -159,6 +214,104 @@ export default function App() {
         }}
       />
     </main>
+  )
+}
+
+function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedCount: number }) {
+  return (
+    <div className="route-result">
+      {route.status === 'conflict' ? (
+        <div className="verdict conflict card-inner">
+          <p className="error-text">{route.conflictMessage}</p>
+          {route.remainingConflicts?.map((check, index) => (
+            <div key={index} className={'check ' + check.status}>
+              <strong>{check.kind} / {check.status}</strong>
+              <p>{check.message}</p>
+              <Chain links={check.chain} />
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {route.confirmedSteps?.length ? (
+        <>
+          <h3>已执行步骤（历史保持原样）</h3>
+          {route.confirmedSteps.map((step) => <StepCard key={'c' + step.index} step={step} />)}
+        </>
+      ) : null}
+      {route.status === 'feasible' ? (
+        route.steps.length === 0 ? (
+          <p className="success-text">目标已达成，没有剩余步骤。</p>
+        ) : (
+          <>
+            <h3>{confirmedCount > 0 ? '剩余步骤（从已完成状态继续）' : '待执行步骤'}</h3>
+            {route.steps.map((step) => <StepCard key={step.index} step={step} />)}
+          </>
+        )
+      ) : route.steps.length > 0 ? (
+        <>
+          <h3>无法继续前已排定的步骤</h3>
+          {route.steps.map((step) => <StepCard key={step.index} step={step} />)}
+        </>
+      ) : null}
+    </div>
+  )
+}
+
+function StepCard({ step }: { step: RouteStep }) {
+  return (
+    <div className={'step-card' + (step.confirmed ? ' confirmed' : '')}>
+      <h3>
+        第 {step.index} 步{step.confirmed ? '（已确认）' : ''}
+        <span className={step.verification.status === 'feasible' ? 'success-text' : 'error-text'}> 独立核验：{step.verification.status}</span>
+      </h3>
+      <ul className="compact">
+        {step.changes.map((change) => (
+          <li key={change.component}>
+            {change.component}：{change.from || '（未安装）'} → {change.to || '（退出）'}
+            {step.transition?.includes(change.component) ? <em className="warning-text">（过渡版本）</em> : null}
+          </li>
+        ))}
+      </ul>
+      {step.together?.length ? <p className="hint">必须一起切换：{step.together.join('、')}</p> : null}
+      {step.note ? <p className="hint">{step.note}</p> : null}
+      <details>
+        <summary>回退说明</summary>
+        <p className="hint">可回退到的兼容状态：</p>
+        <div className="selection">
+          {Object.entries(step.rollback.state).sort().map(([name, version]) => <span key={name}>{name + '@' + version}</span>)}
+        </div>
+        {step.rollback.irreversible?.length ? (
+          <ul className="compact">
+            {step.rollback.irreversible.map((item, index) => <li key={index} className="warning-text">{item}</li>)}
+          </ul>
+        ) : <p className="hint">本步没有不可直接撤回的影响。</p>}
+      </details>
+    </div>
+  )
+}
+
+function SavedRoutes({ routes }: { routes: SavedRoute[] }) {
+  if (routes.length === 0) return null
+  return (
+    <section className="card saved">
+      <h2>已保存路线（重开仍可解释）</h2>
+      <p className="hint">保存时冻结请求与规划结果；重新打开后仍能看到已执行步骤、每个中间状态的独立核验与剩余选择。</p>
+      <table>
+        <thead><tr><th>保存时间</th><th>目标</th><th>结论</th><th>已确认</th><th>剩余步骤</th><th>最终选择</th></tr></thead>
+        <tbody>
+          {[...routes].reverse().map((route) => (
+            <tr key={route.id}>
+              <td>{route.createdAt}</td>
+              <td>{route.request.target} @ {route.request.desiredVersion}</td>
+              <td className={route.report.status === 'feasible' ? 'success-text' : 'error-text'}>{route.report.status}</td>
+              <td>{route.report.confirmedSteps?.length ?? 0} 步</td>
+              <td>{route.report.steps.length} 步</td>
+              <td>{Object.entries(route.report.finalSelection ?? {}).map(([name, version]) => name + '@' + version).join(' ') || '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
   )
 }
 

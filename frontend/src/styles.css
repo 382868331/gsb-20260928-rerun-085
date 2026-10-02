@@ -51,4 +51,12 @@ th { color: #60708a; font-size: 12px; text-transform: uppercase; letter-spacing:
 .compact li { margin: 4px 0; }
 .saved { margin-top: 18px; }
 .saved button { padding: 7px 10px; font-size: 13px; }
+.route-panel { margin-top: 18px; }
+.route-result { margin-top: 14px; }
+.route-result h3 { margin: 14px 0 8px; font-size: 15px; }
+.step-card { border: 1px solid #dce3ee; border-radius: 12px; padding: 12px 14px; margin: 10px 0; background: #f8fafc; }
+.step-card.confirmed { border-color: #88d5a2; background: #f1fbf5; }
+.step-card h3 { margin: 0 0 6px; font-size: 14px; }
+.step-card details { margin-top: 8px; }
+.step-card summary { cursor: pointer; color: #4f46e5; font-weight: 700; }
 @media (max-width: 980px) { .grid, .result-grid { grid-template-columns: 1fr; } textarea { min-height: 360px; } header { align-items: flex-start; flex-direction: column; } }

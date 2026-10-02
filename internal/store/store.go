@@ -61,3 +61,57 @@ func (s *Store) Save(plan domain.Plan) error {
 	}
 	return os.WriteFile(s.path, append(encoded, '\n'), 0o644)
 }
+
+// RouteStore persists staged route plans so a saved route can be reopened and
+// still explain which steps were executed and what remains.
+type RouteStore struct {
+	path string
+	mu   sync.Mutex
+}
+
+func NewRoutes(path string) (*RouteStore, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		if err := os.WriteFile(path, []byte("[]\n"), 0o644); err != nil {
+			return nil, err
+		}
+	}
+	return &RouteStore{path: path}, nil
+}
+
+func (s *RouteStore) List() ([]domain.SavedRoute, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	content, err := os.ReadFile(s.path)
+	if err != nil {
+		return nil, err
+	}
+	routes := []domain.SavedRoute{}
+	if len(content) == 0 {
+		return routes, nil
+	}
+	if err := json.Unmarshal(content, &routes); err != nil {
+		return nil, err
+	}
+	return routes, nil
+}
+
+func (s *RouteStore) Save(route domain.SavedRoute) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	routes := []domain.SavedRoute{}
+	content, err := os.ReadFile(s.path)
+	if err == nil && len(content) > 0 {
+		if err := json.Unmarshal(content, &routes); err != nil {
+			return err
+		}
+	}
+	routes = append(routes, route)
+	encoded, err := json.MarshalIndent(routes, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, append(encoded, '\n'), 0o644)
+}

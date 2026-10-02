@@ -92,6 +92,95 @@ func scenarios() []Scenario {
 				Locks:          map[string]string{},
 			},
 		},
+		{
+			ID:          "mutual",
+			Name:        "相互依赖升级：必须同步切换",
+			Description: "app 2.0.0 要求 lib ^2.0.0，lib 2.0.0 也要求 app ^2.0.0；分阶段路线必须把两者放进同一步，单独升级任一方都没有可行中间状态。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+					}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "2.0.0",
+				Locks:          map[string]string{},
+			},
+		},
+		{
+			ID:          "transition",
+			Name:        "过渡版本：分步到位",
+			Description: "单步不允许跨多个大版本，且 lib 3.0.0 要求 app >= 2.0.0、app 2.0.0 要求 lib ^2.0.0。路线需先同步切到过渡版本 app 2.0.0 + lib 2.0.0，再升 lib 3.0.0，最后升 app 3.0.0。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^3.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: ">=2.0.0"}}},
+					}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "3.0.0",
+				Locks:          map[string]string{},
+			},
+		},
+		{
+			ID:          "optional-exit",
+			Name:        "可选组件退出：不可直接撤回",
+			Description: "cache 是 app 1.0.0 的可选依赖，app 2.0.0 不再需要它。路线会安排 cache 退出运行状态，并标注该影响不可直接撤回（数据与配置需手动处理）。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}, {Component: "cache", Constraint: "^1.0.0", Optional: true}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0"},
+					}},
+					{Name: "cache", Versions: []domain.Version{{Version: "1.0.0"}}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0", "cache": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "2.0.0",
+				Locks:          map[string]string{},
+			},
+		},
+		{
+			ID:          "goal-change",
+			Name:        "中途改变目标：从已完成状态继续",
+			Description: "先以 app 3.0.0 为目标规划并确认第一步（app 2.0.0 + lib 2.0.0），再把目标改成 app 2.0.0 或锁定 lib；后续计划只从已完成状态继续，历史步骤保持原样。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^3.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+					}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "3.0.0",
+				Locks:          map[string]string{},
+			},
+		},
 	}
 }
 

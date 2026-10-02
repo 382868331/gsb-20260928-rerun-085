@@ -10,3 +10,4 @@ __pycache__/
 /data/
 frontend/dist/
 plans.json
+routes.json

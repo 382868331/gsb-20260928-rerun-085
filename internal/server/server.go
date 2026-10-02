@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"dependency-workbench/internal/domain"
+	"dependency-workbench/internal/route"
 	"dependency-workbench/internal/solver"
 	"dependency-workbench/internal/store"
 	"dependency-workbench/internal/verifier"
@@ -17,15 +18,18 @@ import (
 
 type Server struct {
 	store  *store.Store
+	routes *store.RouteStore
 	static fs.FS
 	mux    *http.ServeMux
 }
 
-func New(planStore *store.Store, static fs.FS) *Server {
-	s := &Server{store: planStore, static: static, mux: http.NewServeMux()}
+func New(planStore *store.Store, routeStore *store.RouteStore, static fs.FS) *Server {
+	s := &Server{store: planStore, routes: routeStore, static: static, mux: http.NewServeMux()}
 	s.mux.HandleFunc("/api/scenarios", s.handleScenarios)
 	s.mux.HandleFunc("/api/sample", s.handleSample)
 	s.mux.HandleFunc("/api/solve", s.handleSolve)
+	s.mux.HandleFunc("/api/route/plan", s.handleRoutePlan)
+	s.mux.HandleFunc("/api/routes", s.handleRoutes)
 	s.mux.HandleFunc("/api/plans/verify", s.handleVerify)
 	s.mux.HandleFunc("/api/plans", s.handlePlans)
 	s.mux.HandleFunc("/", s.handleStatic)
@@ -60,6 +64,55 @@ func (s *Server) handleSolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, solver.Solve(req))
+}
+
+func (s *Server) handleRoutePlan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req domain.RouteRequest
+	if err := decode(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, route.Plan(req))
+}
+
+func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
+	if s.routes == nil {
+		writeError(w, http.StatusServiceUnavailable, "route store is not configured")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		routes, err := s.routes.List()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, routes)
+	case http.MethodPost:
+		var req domain.RouteRequest
+		if err := decode(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		report := route.Plan(req)
+		saved := domain.SavedRoute{
+			ID:        newID(),
+			Request:   req,
+			Report:    report,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := s.routes.Save(saved); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, saved)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET or POST required")
+	}
 }
 
 type verifyRequest struct {

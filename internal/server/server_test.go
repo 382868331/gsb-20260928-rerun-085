@@ -20,7 +20,11 @@ func setup(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return server.New(planStore, nil)
+	routeStore, err := store.NewRoutes(filepath.Join(t.TempDir(), "routes.json"))
+	if err != nil {
+		t.Fatalf("route store: %v", err)
+	}
+	return server.New(planStore, routeStore, nil)
 }
 
 func do(t *testing.T, handler http.Handler, method, path string, body any) (int, map[string]any) {
@@ -308,4 +312,67 @@ func encodeDecode[T any](t *testing.T, value any) T {
 
 func contains(haystack, needle string) bool {
 	return bytes.Contains([]byte(haystack), []byte(needle))
+}
+
+func routeRequestFrom(req domain.SolveRequest) map[string]any {
+	return map[string]any{
+		"manifest":       req.Manifest,
+		"current":        req.Current,
+		"target":         req.Target,
+		"desiredVersion": req.DesiredVersion,
+		"locks":          req.Locks,
+	}
+}
+
+func TestRoutePlanEndpointStagesMutualUpgrade(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "mutual")
+	status, body := do(t, handler, http.MethodPost, "/api/route/plan", routeRequestFrom(sample))
+	if status != http.StatusOK {
+		t.Fatalf("status %d", status)
+	}
+	if body["status"] != "feasible" {
+		t.Fatalf("expected feasible, got %v", body["status"])
+	}
+	steps, _ := body["steps"].([]any)
+	if len(steps) != 1 {
+		t.Fatalf("expected one step, got %v", len(steps))
+	}
+	step := steps[0].(map[string]any)
+	if together, _ := step["together"].([]any); len(together) != 2 {
+		t.Fatalf("mutual upgrade must switch together, got %v", step["together"])
+	}
+	verification := step["verification"].(map[string]any)
+	if verification["status"] != "feasible" {
+		t.Fatalf("intermediate state must verify, got %v", verification["status"])
+	}
+}
+
+func TestRouteSaveAndReloadKeepsHistory(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("status %d", status)
+	}
+	report := saved["report"].(map[string]any)
+	if report["status"] != "feasible" {
+		t.Fatalf("expected feasible saved route, got %v", report["status"])
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status %d", rec.Code)
+	}
+	var routes []domain.SavedRoute
+	if err := json.Unmarshal(rec.Body.Bytes(), &routes); err != nil {
+		t.Fatalf("decode routes: %v", err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 saved route, got %d", len(routes))
+	}
+	if len(routes[0].Report.Steps) == 0 || routes[0].Report.Steps[0].Verification.Status != "feasible" {
+		t.Fatalf("saved route must keep per-step verification, got %+v", routes[0].Report.Steps)
+	}
 }
