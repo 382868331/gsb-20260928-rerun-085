@@ -17,6 +17,21 @@ func VerifyRequest(req domain.SolveRequest, selection map[string]string) domain.
 	if selection == nil {
 		selection = map[string]string{}
 	}
+	return verify(manifest, selection, normalizeGoals(req), true)
+}
+
+// CheckState validates a running state purely on dependency consistency:
+// every non-optional requirement of every selected version must be satisfied
+// by the state itself. Migration goal coverage is intentionally not checked,
+// because intermediate route states legitimately do not cover the final goal.
+func CheckState(manifest domain.Manifest, state map[string]string) domain.Report {
+	if state == nil {
+		state = map[string]string{}
+	}
+	return verify(manifest, state, nil, false)
+}
+
+func verify(manifest domain.Manifest, selection map[string]string, goals []domain.MigrationGoal, checkCoverage bool) domain.Report {
 	versions := map[string]map[string]domain.Version{}
 	for _, component := range manifest.Components {
 		versions[component.Name] = map[string]domain.Version{}
@@ -25,7 +40,10 @@ func VerifyRequest(req domain.SolveRequest, selection map[string]string) domain.
 		}
 	}
 	checks := []domain.Check{}
-	goalStatuses := checkGoals(req, selection, versions)
+	var goalStatuses []domain.GoalStatus
+	if checkCoverage {
+		goalStatuses = checkGoalStatuses(goals, selection, versions)
+	}
 	for _, goal := range goalStatuses {
 		switch goal.Status {
 		case "satisfied":
@@ -34,9 +52,9 @@ func VerifyRequest(req domain.SolveRequest, selection map[string]string) domain.
 			checks = append(checks, domain.Check{Kind: "goal", Status: "error", Message: goal.Reason})
 		}
 	}
-	if len(goalStatuses) == 0 {
+	if checkCoverage && len(goalStatuses) == 0 {
 		checks = append(checks, domain.Check{Kind: "coverage", Status: "error", Message: "cannot prove migration coverage because no migration goal was supplied"})
-	} else if len(selection) == 0 {
+	} else if checkCoverage && len(selection) == 0 {
 		message := "selection is empty, so no migration goal is covered"
 		checks = append(checks, domain.Check{Kind: "coverage", Status: "error", Message: message})
 	}
@@ -94,8 +112,7 @@ func CheckSelection(manifest domain.Manifest, selection map[string]string) domai
 	return report
 }
 
-func checkGoals(req domain.SolveRequest, selection map[string]string, versions map[string]map[string]domain.Version) []domain.GoalStatus {
-	goals := normalizeGoals(req)
+func checkGoalStatuses(goals []domain.MigrationGoal, selection map[string]string, versions map[string]map[string]domain.Version) []domain.GoalStatus {
 	seen := map[string]bool{}
 	out := []domain.GoalStatus{}
 	for _, goal := range goals {

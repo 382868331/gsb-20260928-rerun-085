@@ -20,7 +20,11 @@ func setup(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return server.New(planStore, nil)
+	routeStore, err := store.NewRouteStore(filepath.Join(t.TempDir(), "routes.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server.New(planStore, routeStore, nil)
 }
 
 func do(t *testing.T, handler http.Handler, method, path string, body any) (int, map[string]any) {
@@ -308,4 +312,129 @@ func encodeDecode[T any](t *testing.T, value any) T {
 
 func contains(haystack, needle string) bool {
 	return bytes.Contains([]byte(haystack), []byte(needle))
+}
+
+func TestRoutePlanStagesTransitionAndAtomicSwitch(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "staged-transition")
+	_, planned := do(t, handler, http.MethodPost, "/api/routes/plan", req)
+	if got, _ := planned["status"].(string); got != "feasible" {
+		t.Fatalf("route plan status = %q: %v", got, planned)
+	}
+	steps, _ := planned["steps"].([]any)
+	if len(steps) != 3 {
+		t.Fatalf("expected 3 steps, got %v", steps)
+	}
+	first, _ := steps[0].(map[string]any)
+	if first["transitional"] != true {
+		t.Fatalf("first step must be transitional, got %v", first)
+	}
+	verification, _ := first["verification"].(map[string]any)
+	if got, _ := verification["status"].(string); got != "feasible" {
+		t.Fatalf("intermediate state must verify independently, got %v", verification)
+	}
+	last, _ := steps[2].(map[string]any)
+	if last["together"] != true {
+		t.Fatalf("last step must switch components together, got %v", last)
+	}
+}
+
+func TestRouteAdvanceKeepsHistoryAndReplansFromConfirmedState(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "goal-change")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", req)
+	if status != http.StatusCreated {
+		t.Fatalf("save route status %d: %v", status, saved)
+	}
+	routeID, _ := saved["id"].(string)
+	steps, _ := saved["steps"].([]any)
+	if len(steps) != 3 {
+		t.Fatalf("expected 3 planned steps, got %v", steps)
+	}
+	frozenHistory, _ := json.Marshal(steps[0])
+
+	// Confirm the transitional step, then change the final goal to svc 2.1.0.
+	status, advanced := do(t, handler, http.MethodPost, "/api/routes/advance", map[string]any{
+		"id": routeID, "confirm": 1, "target": "svc", "desiredVersion": "2.1.0",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("advance status %d: %v", status, advanced)
+	}
+	if got, _ := advanced["status"].(string); got != "feasible" {
+		t.Fatalf("replanned route must be feasible, got %v", advanced)
+	}
+	if got, _ := advanced["confirmed"].(float64); got != 1 {
+		t.Fatalf("expected 1 confirmed step, got %v", advanced["confirmed"])
+	}
+	newSteps, _ := advanced["steps"].([]any)
+	if len(newSteps) != 3 {
+		t.Fatalf("expected history + 2 replanned steps, got %v", newSteps)
+	}
+	replayedHistory, _ := json.Marshal(newSteps[0])
+	if string(frozenHistory) != string(replayedHistory) {
+		t.Fatalf("confirmed step was recomputed into another route: %s vs %s", frozenHistory, replayedHistory)
+	}
+	finalState, _ := newSteps[2].(map[string]any)["state"].(map[string]any)
+	if finalState["svc"] != "2.1.0" {
+		t.Fatalf("remaining steps must reach the new goal svc 2.1.0, got %v", finalState)
+	}
+	revisions, _ := advanced["revisions"].([]any)
+	if len(revisions) != 1 {
+		t.Fatalf("goal change must be recorded as a revision, got %v", revisions)
+	}
+
+	// A reopened workspace still explains executed steps and remaining choices.
+	listReq := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	listRec := httptest.NewRecorder()
+	handler.ServeHTTP(listRec, listReq)
+	var stored []map[string]any
+	if err := json.Unmarshal(listRec.Body.Bytes(), &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 {
+		t.Fatalf("expected 1 stored route, got %d", len(stored))
+	}
+	storedSteps, _ := stored[0]["steps"].([]any)
+	if len(storedSteps) != 3 {
+		t.Fatalf("persisted route must keep all steps, got %v", storedSteps)
+	}
+	storedFirst, _ := storedSteps[0].(map[string]any)
+	if _, ok := storedFirst["verification"].(map[string]any); !ok {
+		t.Fatalf("persisted step must carry independent verification, got %v", storedFirst)
+	}
+}
+
+func TestRouteAdvanceBlockedReportsRollbackAndRemainingConflict(t *testing.T) {
+	handler := setup(t)
+	req := scenario(t, handler, "goal-change")
+	_, saved := do(t, handler, http.MethodPost, "/api/routes", req)
+	routeID, _ := saved["id"].(string)
+
+	// Confirm the transitional step, then lock db at 1.0.0: svc 2.0.0 requires
+	// db ^2.0.0, so no route remains and the conflict must be explicit.
+	status, advanced := do(t, handler, http.MethodPost, "/api/routes/advance", map[string]any{
+		"id": routeID, "confirm": 1, "locks": map[string]string{"db": "1.0.0"},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("advance status %d: %v", status, advanced)
+	}
+	if got, _ := advanced["status"].(string); got != "blocked" {
+		t.Fatalf("route must be blocked, got %v", advanced)
+	}
+	if msg, _ := advanced["conflictMessage"].(string); msg == "" {
+		t.Fatalf("blocked route must name the remaining conflict, got %v", advanced)
+	}
+	steps, _ := advanced["steps"].([]any)
+	if len(steps) != 1 {
+		t.Fatalf("blocked route keeps only confirmed history, got %v", steps)
+	}
+	rollback, _ := advanced["rollback"].([]any)
+	if len(rollback) != 1 {
+		t.Fatalf("blocked route must list compatible rollback states, got %v", rollback)
+	}
+	point, _ := rollback[0].(map[string]any)
+	state, _ := point["state"].(map[string]any)
+	if state["svc"] != "1.5.0" {
+		t.Fatalf("rollback state must be the confirmed svc 1.5.0 state, got %v", state)
+	}
 }

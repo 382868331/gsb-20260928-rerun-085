@@ -88,3 +88,53 @@ type Plan struct {
 	Consistent   bool   `json:"consistent"`
 	CreatedAt    string `json:"createdAt"`
 }
+
+// RouteStep is one executable stage of a migration route. Applying Changes to
+// the previous state yields State, which must pass independent verification
+// on its own before the next step may start.
+type RouteStep struct {
+	Index        int               `json:"index"`
+	Changes      []Change          `json:"changes"`
+	State        map[string]string `json:"state"`
+	Verification Report            `json:"verification"`
+	Transitional bool              `json:"transitional,omitempty"`
+	Together     bool              `json:"together,omitempty"`
+	Reason       string            `json:"reason,omitempty"`
+}
+
+// RollbackPoint describes a confirmed intermediate state the route can fall
+// back to, and whether reverting that step would break later confirmed steps.
+type RollbackPoint struct {
+	Step       int               `json:"step"`
+	State      map[string]string `json:"state"`
+	Revertible bool              `json:"revertible"`
+	Reason     string            `json:"reason,omitempty"`
+}
+
+// RouteRevision records a goal change made after some steps were confirmed,
+// so a reopened route can explain why remaining steps were replanned.
+type RouteRevision struct {
+	ConfirmedSteps int               `json:"confirmedSteps"`
+	Goals          []MigrationGoal   `json:"goals"`
+	Locks          map[string]string `json:"locks,omitempty"`
+	Note           string            `json:"note"`
+	At             string            `json:"at"`
+}
+
+// Route is a persisted staged migration plan. Confirmed steps are frozen
+// history: replanning after a goal change only ever recomputes the steps
+// after Confirmed, starting from the confirmed state.
+type Route struct {
+	ID              string            `json:"id"`
+	Request         SolveRequest      `json:"request"`
+	Steps           []RouteStep       `json:"steps"`
+	Confirmed       int               `json:"confirmed"`
+	Status          string            `json:"status"`
+	FinalSelection  map[string]string `json:"finalSelection,omitempty"`
+	ConflictMessage string            `json:"conflictMessage,omitempty"`
+	ConflictChain   []ChainLink       `json:"conflictChain,omitempty"`
+	Rollback        []RollbackPoint   `json:"rollback,omitempty"`
+	Revisions       []RouteRevision   `json:"revisions,omitempty"`
+	CreatedAt       string            `json:"createdAt"`
+	UpdatedAt       string            `json:"updatedAt"`
+}

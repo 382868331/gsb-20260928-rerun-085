@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { listPlans, loadSample, loadScenarios, savePlan, solve, verify } from './api'
+import { advanceRoute, listPlans, listRoutes, loadSample, loadScenarios, planRoute, savePlan, saveRoute, solve, verify } from './api'
 import { Chain } from './Chain'
-import type { Plan, Report, Scenario, SolveRequest } from './types'
+import type { Plan, Report, Route, RoutePlan, Scenario, SolveRequest } from './types'
 
 const EMPTY: SolveRequest = { manifest: { components: [] }, current: {}, target: '', desiredVersion: '', locks: {} }
 
@@ -16,6 +16,8 @@ export default function App() {
   const [independentReport, setIndependentReport] = useState<Report | null>(null)
   const [comparisons, setComparisons] = useState<{ label: string; locks: Record<string, string>; report: Report }[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
+  const [routes, setRoutes] = useState<Route[]>([])
+  const [routePreview, setRoutePreview] = useState<RoutePlan | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -26,6 +28,7 @@ export default function App() {
         return applyScenario(items[0]?.id ?? 'base')
       })
       .then(() => refreshPlans())
+      .then(() => refreshRoutes())
       .catch((err) => setError(String(err)))
   }, [])
 
@@ -39,11 +42,16 @@ export default function App() {
     setSavedReport(null)
     setIndependentReport(null)
     setComparisons([])
+    setRoutePreview(null)
     setError('')
   }
 
   function refreshPlans() {
     return listPlans().then(setPlans).catch((err) => setError(String(err)))
+  }
+
+  function refreshRoutes() {
+    return listRoutes().then(setRoutes).catch((err) => setError(String(err)))
   }
 
   const targetVersions = useMemo(() => {
@@ -59,7 +67,7 @@ export default function App() {
     }
   }
 
-  async function run(action: 'solve' | 'save' | 'verify' | 'compare') {
+  async function run(action: 'solve' | 'save' | 'verify' | 'compare' | 'plan-route' | 'save-route') {
     setBusy(true)
     setError('')
     try {
@@ -86,6 +94,14 @@ export default function App() {
         const label = `锁定 ${Object.entries(payload.locks ?? {}).map(([name, version]) => `${name}@${version}`).join('、') || '无锁定'}`
         setComparisons((items) => [...items.filter((item) => item.label !== label), { label, locks: payload.locks ?? {}, report: result }])
       }
+      if (action === 'plan-route') {
+        setRoutePreview(await planRoute(payload))
+      }
+      if (action === 'save-route') {
+        await saveRoute(payload)
+        setRoutePreview(null)
+        await refreshRoutes()
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -108,7 +124,7 @@ export default function App() {
 
       <section className="card scenarios">
         <h2>验证资料</h2>
-        <p className="hint">内置正常升级、循环依赖、锁定版本冲突、不存在候选四类资料；切换会清空当前页面结论，但不会改动已保存方案。</p>
+        <p className="hint">内置常规升级、循环依赖、锁定冲突、缺失候选、过渡版本、相互依赖、可选退出、中途改目标等资料；切换会清空当前页面结论，但不会改动已保存方案与路线。</p>
         <div className="scenario-row">
           <select value={scenarioID} onChange={(event) => void applyScenario(event.target.value)}>
             {scenarios.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
@@ -142,9 +158,15 @@ export default function App() {
             <button onClick={() => void run('solve')} disabled={busy} className="primary">求解 / 重算</button>
             <button onClick={() => void run('compare')} disabled={busy}>用当前锁定加入对比</button>
             <button onClick={() => void run('verify')} disabled={busy || !report}>独立核验当前选择</button>
+            <button onClick={() => void run('plan-route')} disabled={busy}>规划分阶段路线</button>
+            <button onClick={() => void run('save-route')} disabled={busy}>保存为新路线</button>
           </div>
         </div>
       </section>
+
+      {routePreview ? <RoutePlanPreview plan={routePreview} /> : null}
+
+      <SavedRoutes routes={routes} onChanged={refreshRoutes} />
 
       {report ? <Result report={report} saved={savedReport} independent={independentReport} /> : null}
 
@@ -293,5 +315,152 @@ function Result({ report, saved, independent }: { report: Report; saved: Report 
         {consistency === false ? <p className="error-text">页面结论与独立核验不一致。</p> : null}
       </div>
     </section>
+  )
+}
+
+function RoutePlanPreview({ plan }: { plan: RoutePlan }) {
+  return (
+    <section className="card">
+      <h2>分阶段路线预览（未保存）</h2>
+      {plan.status !== 'feasible' ? (
+        <div>
+          <p className="error-text">找不到可执行路线：{plan.conflictMessage}</p>
+          <Chain links={plan.conflictChain} />
+        </div>
+      ) : (
+        <p className="hint">共 {plan.steps.length} 步；每一步落地后的状态都经过独立核验。保存路线后可逐步确认执行。</p>
+      )}
+      <StepList steps={plan.steps} confirmed={0} />
+    </section>
+  )
+}
+
+function StepList({ steps, confirmed }: { steps: Route['steps']; confirmed: number }) {
+  if (steps.length === 0) return null
+  return (
+    <ol className="steps">
+      {steps.map((step) => (
+        <li key={step.index} className={'step' + (step.index <= confirmed ? ' confirmed' : '')}>
+          <div>
+            <strong>第 {step.index} 步</strong>
+            {step.index <= confirmed ? <span className="badge">已确认</span> : null}
+            {step.transitional ? <span className="badge warn">过渡版本</span> : null}
+            {step.together ? <span className="badge warn">一起切换</span> : null}
+            <span className={step.verification.status === 'feasible' ? 'success-text' : 'error-text'}>
+              独立核验：{step.verification.status}
+            </span>
+          </div>
+          <ul className="compact">
+            {step.changes.map((change) => (
+              <li key={change.component}>{change.component}：{change.from || '未安装'} → {change.to}<span className="hint">（{change.reason}）</span></li>
+            ))}
+          </ul>
+          {step.reason ? <p className="hint">{step.reason}</p> : null}
+          {step.verification.checks.filter((check) => check.status === 'warning').map((check, index) => (
+            <p key={index} className="warning-text">{check.message}</p>
+          ))}
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+function SavedRoutes({ routes, onChanged }: { routes: Route[]; onChanged: () => Promise<void> }) {
+  return (
+    <section className="card">
+      <h2>分阶段迁移路线</h2>
+      <p className="hint">已确认的步骤是冻结历史：修改最终目标或锁定未升级组件后，只从已确认状态继续规划，历史步骤不会被重算。保存重开后仍保留每步状态与独立核验。</p>
+      {routes.length === 0 ? <p className="hint">还没有保存的路线。</p> : routes.map((route) => (
+        <RouteCard key={route.id} route={route} onChanged={onChanged} />
+      ))}
+    </section>
+  )
+}
+
+function RouteCard({ route, onChanged }: { route: Route; onChanged: () => Promise<void> }) {
+  const [target, setTarget] = useState(route.request.target)
+  const [version, setVersion] = useState('')
+  const [locksText, setLocksText] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function advance(payload: { confirm: number; changeGoal: boolean }) {
+    setBusy(true)
+    setError('')
+    try {
+      const body: Parameters<typeof advanceRoute>[0] = { id: route.id, confirm: payload.confirm }
+      if (payload.changeGoal) {
+        if (version) {
+          body.target = target
+          body.desiredVersion = version
+        }
+        if (locksText.trim()) {
+          body.locks = JSON.parse(locksText) as Record<string, string>
+        }
+      }
+      await advanceRoute(body)
+      await onChanged()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remaining = route.steps.length - route.confirmed
+  return (
+    <div className={'route-card ' + route.status}>
+      <h3>
+        {route.request.target} → {route.request.desiredVersion}
+        <span className={route.status === 'feasible' ? 'success-text' : 'error-text'}>（{route.status === 'feasible' ? '路线可执行' : '路线受阻'}）</span>
+      </h3>
+      <p className="hint">已确认 {route.confirmed} / {route.steps.length} 步 · 更新于 {route.updatedAt}</p>
+      {error ? <p className="error-text">{error}</p> : null}
+      {route.status === 'blocked' ? (
+        <div className="error-box">
+          <p className="error-text">剩余冲突：{route.conflictMessage}</p>
+          <Chain links={route.conflictChain} />
+          {route.rollback?.length ? (
+            <div>
+              <p className="hint">可回退到的兼容状态：</p>
+              <ul className="compact">
+                {route.rollback.map((point) => (
+                  <li key={point.step}>
+                    第 {point.step} 步之后：{Object.entries(point.state).map(([name, v]) => `${name}@${v}`).join(' ')}
+                    {point.revertible
+                      ? <span className="success-text">（可直接撤回）</span>
+                      : <span className="warning-text">（不可直接撤回：{point.reason}）</span>}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      <StepList steps={route.steps} confirmed={route.confirmed} />
+      {route.revisions?.length ? (
+        <div>
+          <p className="hint">目标变更记录：</p>
+          <ul className="compact">
+            {route.revisions.map((revision, index) => (
+              <li key={index}>{revision.at}：确认 {revision.confirmedSteps} 步后调整目标/锁定，{revision.note}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      <div className="actions">
+        <button disabled={busy || remaining <= 0} onClick={() => void advance({ confirm: 1, changeGoal: false })}>确认下一步（剩余 {remaining}）</button>
+        <label>改目标
+          <input value={target} onChange={(event) => setTarget(event.target.value)} placeholder="组件" />
+        </label>
+        <label>版本
+          <input value={version} onChange={(event) => setVersion(event.target.value)} placeholder="如 2.1.0" />
+        </label>
+        <label>锁定（JSON）
+          <input value={locksText} onChange={(event) => setLocksText(event.target.value)} placeholder='{"db":"1.0.0"}' />
+        </label>
+        <button disabled={busy || (!version && !locksText.trim())} onClick={() => void advance({ confirm: 0, changeGoal: true })}>改目标/锁定并继续规划</button>
+      </div>
+    </div>
   )
 }

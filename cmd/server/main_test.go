@@ -18,11 +18,15 @@ func TestEmbeddedFrontendAndAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	routeStore, err := store.NewRouteStore(filepath.Join(t.TempDir(), "routes.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	webFS, err := fs.Sub(staticFS, "static")
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := server.New(planStore, webFS)
+	handler := server.New(planStore, routeStore, webFS)
 	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "server.sock"))
 	if err != nil {
 		t.Skipf("unix sockets unavailable: %v", err)

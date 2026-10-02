@@ -40,3 +40,46 @@ export type Plan = {
   consistent: boolean
   createdAt: string
 }
+export type RouteStep = {
+  index: number
+  changes: Change[]
+  state: Record<string, string>
+  verification: Report
+  transitional?: boolean
+  together?: boolean
+  reason?: string
+}
+export type RollbackPoint = {
+  step: number
+  state: Record<string, string>
+  revertible: boolean
+  reason?: string
+}
+export type RouteRevision = {
+  confirmedSteps: number
+  goals: Array<{ component: string; version: string }>
+  locks?: Record<string, string>
+  note: string
+  at: string
+}
+export type Route = {
+  id: string
+  request: SolveRequest
+  steps: RouteStep[]
+  confirmed: number
+  status: string
+  finalSelection?: Record<string, string>
+  conflictMessage?: string
+  conflictChain?: ChainLink[]
+  rollback?: RollbackPoint[]
+  revisions?: RouteRevision[]
+  createdAt: string
+  updatedAt: string
+}
+export type RoutePlan = {
+  steps: RouteStep[]
+  status: string
+  finalSelection?: Record<string, string>
+  conflictMessage?: string
+  conflictChain?: ChainLink[]
+}

@@ -51,4 +51,16 @@ th { color: #60708a; font-size: 12px; text-transform: uppercase; letter-spacing:
 .compact li { margin: 4px 0; }
 .saved { margin-top: 18px; }
 .saved button { padding: 7px 10px; font-size: 13px; }
+.steps { margin: 10px 0; padding-left: 22px; }
+.step { margin: 10px 0; padding: 10px 12px; border: 1px solid #dce3ee; border-radius: 10px; background: #f8fafc; }
+.step.confirmed { border-color: #88d5a2; background: #f1fbf5; }
+.step > div { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.badge { background: #dcfce7; color: #15803d; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 700; }
+.badge.warn { background: #fef3c7; color: #a16207; }
+.route-card { border: 1px solid #dce3ee; border-radius: 12px; padding: 14px; margin: 12px 0; }
+.route-card.blocked { border-color: #f4a6a6; }
+.route-card h3 { margin: 0 0 6px; font-size: 15px; }
+.route-card .actions { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-top: 10px; }
+.route-card label { display: flex; flex-direction: column; font-size: 12px; color: #60708a; gap: 4px; }
+.error-box { background: #fff1f2; border-radius: 10px; padding: 10px 12px; margin: 8px 0; }
 @media (max-width: 980px) { .grid, .result-grid { grid-template-columns: 1fr; } textarea { min-height: 360px; } header { align-items: flex-start; flex-direction: column; } }
