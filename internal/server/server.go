@@ -120,6 +120,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			Report:      report,
 			CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		}
+		saved.ExecutedState, saved.Irreversible = route.ExecutedSummary(req, report)
 		if err := s.routes.Save(saved); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -191,6 +192,16 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "must record an outcome for every attached check")
 		return
 	}
+	known := map[string]bool{}
+	for _, check := range step.Checks {
+		known[check.ID] = true
+	}
+	for _, check := range payload.Checks {
+		if !known[check.ID] {
+			writeError(w, http.StatusBadRequest, "unknown check id: "+check.ID)
+			return
+		}
+	}
 	step.Checks = append([]domain.StepCheck{}, payload.Checks...)
 	allSuccess := true
 	for _, check := range step.Checks {
@@ -211,6 +222,12 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 	saved.Report.Steps = remaining
 	saved.Report.ConfirmedSteps = append(saved.Report.ConfirmedSteps, *step)
 	saved.Request.Confirmed = append(saved.Request.Confirmed, *step)
+	if !allSuccess {
+		// A step whose checks did not all succeed stays visible as held:
+		// its record is preserved but it never counts as completed.
+		saved.Report.HeldSteps = append(saved.Report.HeldSteps, *step)
+	}
+	saved.ExecutedState, saved.Irreversible = route.ExecutedSummary(saved.Request, saved.Report)
 	if err := s.routes.Update(*saved); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

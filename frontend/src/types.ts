@@ -81,6 +81,11 @@ export type SavedRoute = {
   fingerprint?: string
   request: RouteRequest
   report: RouteReport
+  // executedState: the running set actually reached (effective steps only),
+  // stored separately from the plan; irreversible: data impacts already
+  // incurred, including steps whose checks failed.
+  executedState?: Record<string, string>
+  irreversible?: string[]
   createdAt: string
 }
 export type ConfirmRequest = { routeId: string; stepIndex: number; checks: StepCheck[] }

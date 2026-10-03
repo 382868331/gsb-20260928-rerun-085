@@ -475,6 +475,69 @@ func TestRouteConfirmRecordsChecksOnce(t *testing.T) {
 	}
 }
 
+func TestSavedRouteSeparatesPlanExecutedStateAndImpacts(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	// Nothing executed yet: executed state is the current set, impacts empty,
+	// and the plan (final selection) is stored separately.
+	executed, _ := saved["executedState"].(map[string]any)
+	if executed["app"] != "1.0.0" {
+		t.Fatalf("executed state must start at the current set, got %v", executed)
+	}
+	report := saved["report"].(map[string]any)
+	final, _ := report["finalSelection"].(map[string]any)
+	if final["app"] == executed["app"] {
+		t.Fatalf("plan and executed state must be stored separately, both %v", final)
+	}
+	routeID, _ := saved["id"].(string)
+	steps, _ := report["steps"].([]any)
+	first := steps[0].(map[string]any)
+	checks, _ := first["checks"].([]any)
+	// Record a failed check: the data conversion was executed and must not
+	// be treated as never happened, even though the step is not effective.
+	failed := []map[string]any{}
+	for _, item := range checks {
+		check := item.(map[string]any)
+		failed = append(failed, map[string]any{"id": check["id"], "label": check["label"], "status": "failed"})
+	}
+	status, updated := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": failed,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, updated)
+	}
+	// The failed step's version change must not leak into the executed state.
+	executed, _ = updated["executedState"].(map[string]any)
+	if executed["app"] != "1.0.0" {
+		t.Fatalf("failed step must not change the executed state, got %v", executed)
+	}
+	impacts, _ := updated["irreversible"].([]any)
+	if len(impacts) == 0 {
+		t.Fatalf("executed data conversion must be kept as irreversible impact, got %v", updated)
+	}
+	// Reopening the saved route keeps the same separated records.
+	req := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var routes []domain.SavedRoute
+	if err := json.Unmarshal(rec.Body.Bytes(), &routes); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(routes))
+	}
+	if routes[0].ExecutedState["app"] != "1.0.0" || len(routes[0].Irreversible) == 0 {
+		t.Fatalf("reopened route must keep executed state and impacts, got %+v", routes[0])
+	}
+	if len(routes[0].Report.HeldSteps) != 1 {
+		t.Fatalf("failed step must stay visible as held, got %+v", routes[0].Report)
+	}
+}
+
 func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 	handler := setup(t)
 	sample := scenario(t, handler, "transition")

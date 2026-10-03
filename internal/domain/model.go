@@ -168,7 +168,15 @@ type SavedRoute struct {
 	Fingerprint string       `json:"fingerprint,omitempty"`
 	Request     RouteRequest `json:"request"`
 	Report      RouteReport  `json:"report"`
-	CreatedAt   string       `json:"createdAt"`
+	// ExecutedState is the running set actually reached so far (effective
+	// steps only), stored separately from the plan and the final selection
+	// so a reopened route never mistakes planned versions for reality.
+	ExecutedState map[string]string `json:"executedState,omitempty"`
+	// Irreversible accumulates data impacts from every executed step,
+	// including held steps whose checks failed: a failed check does not
+	// undo a data conversion that already ran.
+	Irreversible []string `json:"irreversible,omitempty"`
+	CreatedAt    string   `json:"createdAt"`
 }
 
 // ConfirmRequest records the user's check outcomes for one step of a saved

@@ -282,6 +282,81 @@ func TestUnrecordedOrFailedChecksHoldTheStep(t *testing.T) {
 	}
 }
 
+func TestOptionsNeverShowPlannedFutureAsCurrentState(t *testing.T) {
+	manifest := mutualManifest()
+	report := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if report.Status != "feasible" || len(report.Steps) != 2 {
+		t.Fatalf("expected a feasible two-step route, got %s (%d steps)", report.Status, len(report.Steps))
+	}
+	if len(report.Options) == 0 {
+		t.Fatal("options must be offered")
+	}
+	for _, option := range report.Options {
+		if option.Kind == "rollback" {
+			continue
+		}
+		if option.State["app"] != "1.0.0" {
+			t.Fatalf("option %s must show the actual current state, not the planned final version, got %v", option.Kind, option.State)
+		}
+	}
+	if report.FinalSelection["app"] != "3.0.0" {
+		t.Fatalf("final selection must still plan app 3.0.0, got %v", report.FinalSelection)
+	}
+}
+
+func TestFailedCheckDataConversionStillCountsAsHappened(t *testing.T) {
+	manifest := mutualManifest()
+	initial := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if initial.Status != "feasible" || len(initial.Steps) == 0 {
+		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
+	}
+	// The step was executed (cross-major data migration ran) but its check
+	// failed: planning must not treat the conversion as never happened.
+	failed := initial.Steps[0]
+	for i := range failed.Checks {
+		failed.Checks[i].Status = "failed"
+	}
+	if len(failed.Rollback.Irreversible) == 0 {
+		t.Fatalf("cross-major step must carry irreversible impacts, got %+v", failed.Rollback)
+	}
+	report := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{failed},
+	})
+	if len(report.HeldSteps) != 1 {
+		t.Fatalf("failed step must be held, got %+v", report.HeldSteps)
+	}
+	if len(report.Options) == 0 {
+		t.Fatal("options must be offered after a failed check")
+	}
+	for _, option := range report.Options {
+		joined := ""
+		for _, impact := range option.Impacts {
+			joined += impact
+		}
+		if !strings.Contains(joined, "数据迁移") && !strings.Contains(joined, "数据转换") {
+			t.Fatalf("option %s must keep the irreversible data impact of the executed step, got %v", option.Kind, option.Impacts)
+		}
+	}
+	// Version planning still resumes from the truly verified state.
+	if report.ResumedFrom["app"] != "1.0.0" {
+		t.Fatalf("planning resumes from the verified state, got %v", report.ResumedFrom)
+	}
+}
+
 func TestOptionsExplainUnresolvedImpacts(t *testing.T) {
 	manifest := domain.Manifest{Components: []domain.Component{
 		{Name: "app", Versions: []domain.Version{

@@ -46,7 +46,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 			report := failRoute(req, fmt.Sprintf("已确认的第 %d 步与当前状态不一致：历史步骤不能被重算成另一条路线", i+1), nil)
 			report.ConfirmedSteps = confirmed
 			report.HeldSteps = held
-			report.Options = buildOptions(req.Manifest, goals, state, confirmed, req.Current)
+			report.Options = buildOptions(req.Manifest, goals, state, executedWithImpacts(confirmed, held), req.Current)
 			return report
 		}
 		step.Index = i + 1
@@ -59,7 +59,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 			report.ConfirmedSteps = confirmed
 			report.HeldSteps = held
 			report.ResumedFrom = cloneMap(previous)
-			report.Options = buildOptions(req.Manifest, goals, previous, confirmed, req.Current)
+			report.Options = buildOptions(req.Manifest, goals, previous, executedWithImpacts(confirmed, held), req.Current)
 			return report
 		}
 		confirmed = append(confirmed, step)
@@ -78,7 +78,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 		report.ConfirmedSteps = confirmed
 		report.HeldSteps = held
 		report.ResumedFrom = state
-		report.Options = buildOptions(req.Manifest, goals, state, confirmed, req.Current)
+		report.Options = buildOptions(req.Manifest, goals, state, executedWithImpacts(confirmed, held), req.Current)
 		return report
 	}
 	final := solveReport.Selection
@@ -102,7 +102,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 				FinalSelection:     cloneMap(final),
 				ConflictMessage:    "剩余改动无法排出可执行的下一步：任意组合都会破坏当前运行组件的约束",
 				RemainingConflicts: remainingConflicts(req.Manifest, state, pending),
-				Options:            buildOptions(req.Manifest, goals, state, confirmed, req.Current),
+				Options:            buildOptions(req.Manifest, goals, resumed, executedWithImpacts(confirmed, held), req.Current),
 			}
 			return report
 		}
@@ -118,8 +118,40 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 		HeldSteps:      held,
 		Steps:          steps,
 		FinalSelection: cloneMap(final),
-		Options:        buildOptions(req.Manifest, goals, state, confirmed, req.Current),
+		Options:        buildOptions(req.Manifest, goals, resumed, executedWithImpacts(confirmed, held), req.Current),
 	}
+}
+
+// executedWithImpacts treats every physically executed step as a source of
+// irreversible impact, including held steps whose checks failed or are
+// insufficient: a failed check never undoes a data conversion that already
+// ran, so its impact must survive into every option.
+func executedWithImpacts(confirmed, held []domain.RouteStep) []domain.RouteStep {
+	out := append([]domain.RouteStep{}, confirmed...)
+	return append(out, held...)
+}
+
+// ExecutedSummary separates what actually happened from what was only
+// planned: the running set reached by effective steps alone, and every
+// irreversible data impact incurred by executed steps (held ones included).
+func ExecutedSummary(req domain.RouteRequest, report domain.RouteReport) (map[string]string, []string) {
+	state := cloneMap(req.Current)
+	for _, step := range report.ConfirmedSteps {
+		if step.Effective {
+			state = applyChanges(state, step.Changes)
+		}
+	}
+	impacts := []string{}
+	seen := map[string]bool{}
+	for _, step := range executedWithImpacts(report.ConfirmedSteps, report.HeldSteps) {
+		for _, impact := range step.Rollback.Irreversible {
+			if !seen[impact] {
+				seen[impact] = true
+				impacts = append(impacts, impact)
+			}
+		}
+	}
+	return state, impacts
 }
 
 // stepEffective reports whether a confirmed step may be treated as really
