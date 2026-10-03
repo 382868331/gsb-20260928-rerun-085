@@ -127,7 +127,7 @@ func TestConfirmedStepsAreKeptAndPlanningResumes(t *testing.T) {
 	if initial.Status != "feasible" || len(initial.Steps) == 0 {
 		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
 	}
-	confirmed := []domain.RouteStep{initial.Steps[0]}
+	confirmed := []domain.RouteStep{executed(initial.Steps[0], "success")}
 
 	// Mid-way goal change: app 3.0.0 -> app 2.0.0 after the first step.
 	replanned := Plan(domain.RouteRequest{
@@ -189,6 +189,162 @@ func TestNoRouteReportsRemainingConflicts(t *testing.T) {
 	}
 	if report.ConflictMessage == "" {
 		t.Fatalf("conflict must be explained")
+	}
+}
+
+// executed marks a planned step as run with every planned check recorded
+// with the given result.
+func executed(step domain.RouteStep, result string) domain.RouteStep {
+	step.Executed = true
+	step.Records = nil
+	for _, check := range step.Checks {
+		step.Records = append(step.Records, domain.CheckRecord{Name: check.Name, Result: result})
+	}
+	return step
+}
+
+func TestPlannedStepsCarryChecks(t *testing.T) {
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if report.Status != "feasible" {
+		t.Fatalf("expected feasible, got %s", report.Status)
+	}
+	for i, step := range report.Steps {
+		if len(step.Checks) == 0 {
+			t.Fatalf("step %d must carry planned checks", i+1)
+		}
+	}
+	foundMigrationCheck := false
+	for _, check := range report.Steps[0].Checks {
+		if strings.Contains(check.Name, "数据迁移核对") {
+			foundMigrationCheck = true
+		}
+	}
+	if !foundMigrationCheck {
+		t.Fatalf("cross-major step must require a data migration check, got %+v", report.Steps[0].Checks)
+	}
+}
+
+func TestFailedCheckBlocksRouteAndOffersOptions(t *testing.T) {
+	initial := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	step := executed(initial.Steps[0], "failure")
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{step},
+	})
+	if report.Status != "blocked" {
+		t.Fatalf("failed check must block the route, got %s", report.Status)
+	}
+	if len(report.Options) != 3 {
+		t.Fatalf("expected continue/rollback/stop options, got %+v", report.Options)
+	}
+	kinds := map[string]domain.RouteOption{}
+	for _, option := range report.Options {
+		kinds[option.Kind] = option
+		if len(option.Unresolved) == 0 {
+			t.Fatalf("option %s must list unresolved impacts", option.Kind)
+		}
+	}
+	if kinds["continue"].State["app"] != "2.0.0" {
+		t.Fatalf("continue must keep the executed state, got %v", kinds["continue"].State)
+	}
+	if kinds["rollback"].State["app"] != "1.0.0" {
+		t.Fatalf("rollback must return the compatible old state, got %v", kinds["rollback"].State)
+	}
+	// The executed conversion and its records must survive replanning.
+	if len(report.ConfirmedSteps) != 1 || len(report.ConfirmedSteps[0].Records) == 0 {
+		t.Fatalf("executed step and its check records must be preserved, got %+v", report.ConfirmedSteps)
+	}
+}
+
+func TestAcceptedFailureContinuesFromExecutedState(t *testing.T) {
+	initial := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	step := executed(initial.Steps[0], "failure")
+	step.AcceptedFailure = true
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{step},
+	})
+	if report.Status != "feasible" {
+		t.Fatalf("accepted failure must resume planning, got %s: %s", report.Status, report.ConflictMessage)
+	}
+	if len(report.Steps) == 0 || report.Steps[0].Changes[0].From != "2.0.0" {
+		t.Fatalf("planning must resume from the executed state, got %+v", report.Steps)
+	}
+}
+
+func TestInsufficientDataKeepsStepPending(t *testing.T) {
+	initial := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	step := executed(initial.Steps[0], "insufficient-data")
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{step},
+	})
+	if report.Status != "pending" {
+		t.Fatalf("insufficient-data must keep the step pending, got %s", report.Status)
+	}
+	if report.PendingStep == nil || report.PendingStep.Index != 1 {
+		t.Fatalf("the unproven step must be reported as pending, got %+v", report.PendingStep)
+	}
+	if len(report.Steps) == 0 || report.Steps[0].Changes[0].From != "1.0.0" {
+		t.Fatalf("an unproven step must not count as effective, got %+v", report.Steps)
+	}
+	if len(report.ConfirmedSteps) != 0 {
+		t.Fatalf("unproven steps must not enter history, got %+v", report.ConfirmedSteps)
+	}
+}
+
+func TestUnexecutedConfirmedStepIsNotTakenAsDone(t *testing.T) {
+	initial := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	// A step listed in the plan but never executed nor checked proves nothing.
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{initial.Steps[0]},
+	})
+	if report.Status != "feasible" {
+		t.Fatalf("expected feasible, got %s", report.Status)
+	}
+	if len(report.ConfirmedSteps) != 0 {
+		t.Fatalf("unexecuted step must not be treated as done, got %+v", report.ConfirmedSteps)
+	}
+	if len(report.Steps) == 0 || report.Steps[0].Changes[0].From != "1.0.0" {
+		t.Fatalf("planning must restart from the real state, got %+v", report.Steps)
 	}
 }
 

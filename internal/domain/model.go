@@ -101,6 +101,37 @@ type RouteStep struct {
 	Verification Report            `json:"verification"`
 	Rollback     RollbackInfo      `json:"rollback"`
 	Confirmed    bool              `json:"confirmed,omitempty"`
+	// Checks are the verifications the operator must perform after running
+	// the step; Records are the outcomes they reported. A step only counts
+	// as completed when it was executed and every planned check was
+	// recorded as success — being listed in a plan never proves effect.
+	Checks          []StepCheck   `json:"checks,omitempty"`
+	Records         []CheckRecord `json:"records,omitempty"`
+	Executed        bool          `json:"executed,omitempty"`
+	AcceptedFailure bool          `json:"acceptedFailure,omitempty"`
+}
+
+// StepCheck is a verification attached to a planned step.
+type StepCheck struct {
+	Name   string `json:"name"`
+	Expect string `json:"expect"`
+}
+
+// CheckRecord is the operator-reported outcome of one planned check.
+// Result is "success", "failure" or "insufficient-data".
+type CheckRecord struct {
+	Name   string `json:"name"`
+	Result string `json:"result"`
+	Note   string `json:"note,omitempty"`
+}
+
+// RouteOption is one way forward when a recorded check blocks the route.
+// Unresolved lists the impacts that the option does not undo by itself.
+type RouteOption struct {
+	Kind       string            `json:"kind"` // continue | rollback | stop
+	Title      string            `json:"title"`
+	State      map[string]string `json:"state,omitempty"`
+	Unresolved []string          `json:"unresolved,omitempty"`
 }
 
 // RollbackInfo describes the compatible state a step can fall back to and
@@ -131,6 +162,8 @@ type RouteReport struct {
 	FinalSelection     map[string]string `json:"finalSelection,omitempty"`
 	ConflictMessage    string            `json:"conflictMessage,omitempty"`
 	RemainingConflicts []Check           `json:"remainingConflicts,omitempty"`
+	PendingStep        *RouteStep        `json:"pendingStep,omitempty"`
+	Options            []RouteOption     `json:"options,omitempty"`
 }
 
 type SavedRoute struct {

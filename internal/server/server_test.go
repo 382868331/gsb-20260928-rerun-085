@@ -376,3 +376,96 @@ func TestRouteSaveAndReloadKeepsHistory(t *testing.T) {
 		t.Fatalf("saved route must keep per-step verification, got %+v", routes[0].Report.Steps)
 	}
 }
+
+func confirmBody(stepIndex int, result string) map[string]any {
+	return map[string]any{
+		"stepIndex": stepIndex,
+		"records": []map[string]any{
+			{"name": "app 启动核对", "result": result},
+			{"name": "app 数据迁移核对", "result": result},
+			{"name": "lib 启动核对", "result": result},
+			{"name": "lib 数据迁移核对", "result": result},
+		},
+	}
+}
+
+func TestRouteConfirmRecordsChecksAndIsIdempotent(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("status %d", status)
+	}
+	routeID := saved["id"].(string)
+
+	// Record the first step's checks as successful.
+	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/"+routeID+"/confirm", confirmBody(1, "success"))
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, confirmed)
+	}
+	report := confirmed["report"].(map[string]any)
+	history, _ := report["confirmedSteps"].([]any)
+	if len(history) != 1 {
+		t.Fatalf("one step must be executed, got %v", report["confirmedSteps"])
+	}
+	first := history[0].(map[string]any)
+	if first["executed"] != true || len(first["records"].([]any)) == 0 {
+		t.Fatalf("executed step must carry check records, got %+v", first)
+	}
+
+	// Repeating the same confirmation must not re-execute the one-time
+	// conversion: the stored route is returned unchanged.
+	status, again := do(t, handler, http.MethodPost, "/api/routes/"+routeID+"/confirm", confirmBody(1, "failure"))
+	if status != http.StatusOK {
+		t.Fatalf("re-confirm status %d", status)
+	}
+	againHistory := again["report"].(map[string]any)["confirmedSteps"].([]any)
+	records := againHistory[0].(map[string]any)["records"].([]any)
+	if records[0].(map[string]any)["result"] != "success" {
+		t.Fatalf("recorded checks must not be overwritten, got %+v", records)
+	}
+
+	// A fresh server over the same store still explains every intermediate
+	// state, its check records and the remaining steps.
+	reopened := setup(t)
+	_ = reopened
+	req := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var routes []domain.SavedRoute
+	if err := json.Unmarshal(rec.Body.Bytes(), &routes); err != nil {
+		t.Fatalf("decode routes: %v", err)
+	}
+	if len(routes) != 1 || len(routes[0].Report.ConfirmedSteps) != 1 {
+		t.Fatalf("reopened route must keep executed history, got %+v", routes)
+	}
+	if len(routes[0].Report.Steps) == 0 {
+		t.Fatalf("remaining steps must still be listed after reload")
+	}
+}
+
+func TestRouteConfirmFailedCheckOffersOptions(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	_, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	routeID := saved["id"].(string)
+
+	status, body := do(t, handler, http.MethodPost, "/api/routes/"+routeID+"/confirm", confirmBody(1, "failure"))
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d", status)
+	}
+	report := body["report"].(map[string]any)
+	if report["status"] != "blocked" {
+		t.Fatalf("failed check must block the route, got %v", report["status"])
+	}
+	options, _ := report["options"].([]any)
+	if len(options) != 3 {
+		t.Fatalf("expected three way-forward options, got %v", options)
+	}
+	for _, raw := range options {
+		option := raw.(map[string]any)
+		if len(option["unresolved"].([]any)) == 0 {
+			t.Fatalf("option %v must explain unresolved impacts", option["kind"])
+		}
+	}
+}

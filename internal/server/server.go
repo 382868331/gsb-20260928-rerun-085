@@ -29,11 +29,111 @@ func New(planStore *store.Store, routeStore *store.RouteStore, static fs.FS) *Se
 	s.mux.HandleFunc("/api/sample", s.handleSample)
 	s.mux.HandleFunc("/api/solve", s.handleSolve)
 	s.mux.HandleFunc("/api/route/plan", s.handleRoutePlan)
+	s.mux.HandleFunc("/api/routes/", s.handleRouteConfirm)
 	s.mux.HandleFunc("/api/routes", s.handleRoutes)
 	s.mux.HandleFunc("/api/plans/verify", s.handleVerify)
 	s.mux.HandleFunc("/api/plans", s.handlePlans)
 	s.mux.HandleFunc("/", s.handleStatic)
 	return s
+}
+
+type confirmRequest struct {
+	StepIndex      int                    `json:"stepIndex"`
+	Records        []domain.CheckRecord   `json:"records"`
+	AcceptFailure  bool                   `json:"acceptFailure,omitempty"`
+	Target         string                 `json:"target,omitempty"`
+	DesiredVersion string                 `json:"desiredVersion,omitempty"`
+	Goals          []domain.MigrationGoal `json:"goals,omitempty"`
+	Locks          map[string]string      `json:"locks,omitempty"`
+}
+
+// handleRouteConfirm records check outcomes for one step of a saved route and
+// replans the remainder from the genuinely completed state. It is idempotent:
+// a step that already has records is returned unchanged, so a save interrupted
+// and retried never re-executes a one-time conversion. Executed steps and
+// their records are always carried over from the stored route, never taken
+// from the client.
+func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
+	if s.routes == nil {
+		writeError(w, http.StatusServiceUnavailable, "route store is not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/routes/")
+	id = strings.TrimSuffix(id, "/confirm")
+	var payload confirmRequest
+	if err := decode(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	routes, err := s.routes.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var saved *domain.SavedRoute
+	for i := range routes {
+		if routes[i].ID == id {
+			saved = &routes[i]
+		}
+	}
+	if saved == nil {
+		writeError(w, http.StatusNotFound, "unknown route")
+		return
+	}
+	all := append(append([]domain.RouteStep{}, saved.Report.ConfirmedSteps...), saved.Report.Steps...)
+	var target *domain.RouteStep
+	for i := range all {
+		if all[i].Index == payload.StepIndex {
+			target = &all[i]
+		}
+	}
+	if target == nil {
+		writeError(w, http.StatusNotFound, "unknown step index")
+		return
+	}
+	if target.Executed && len(target.Records) > 0 {
+		// Already recorded: replaying the confirmation must not re-execute
+		// the step's one-time conversions.
+		writeJSON(w, http.StatusOK, saved)
+		return
+	}
+	target.Executed = true
+	target.Records = payload.Records
+	target.AcceptedFailure = payload.AcceptFailure
+
+	confirmed := []domain.RouteStep{}
+	for _, step := range all {
+		if step.Index <= payload.StepIndex && step.Executed {
+			confirmed = append(confirmed, step)
+		}
+	}
+	req := saved.Request
+	req.Confirmed = confirmed
+	if payload.Target != "" {
+		req.Target = payload.Target
+		req.DesiredVersion = payload.DesiredVersion
+	}
+	if payload.Goals != nil {
+		req.Goals = payload.Goals
+	}
+	if payload.Locks != nil {
+		req.Locks = payload.Locks
+	}
+	updated := domain.SavedRoute{
+		ID:        saved.ID,
+		Request:   req,
+		Report:    route.Plan(req),
+		CreatedAt: saved.CreatedAt,
+	}
+	if err := s.routes.Update(updated); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

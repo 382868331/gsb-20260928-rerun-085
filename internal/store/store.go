@@ -115,3 +115,33 @@ func (s *RouteStore) Save(route domain.SavedRoute) error {
 	}
 	return os.WriteFile(s.path, append(encoded, '\n'), 0o644)
 }
+
+// Update replaces the stored route with the same ID. The caller is
+// responsible for carrying executed steps and their check records over
+// verbatim — Update itself never merges or drops history.
+func (s *RouteStore) Update(route domain.SavedRoute) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	routes := []domain.SavedRoute{}
+	content, err := os.ReadFile(s.path)
+	if err == nil && len(content) > 0 {
+		if err := json.Unmarshal(content, &routes); err != nil {
+			return err
+		}
+	}
+	found := false
+	for i := range routes {
+		if routes[i].ID == route.ID {
+			routes[i] = route
+			found = true
+		}
+	}
+	if !found {
+		routes = append(routes, route)
+	}
+	encoded, err := json.MarshalIndent(routes, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, append(encoded, '\n'), 0o644)
+}

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { listPlans, listRoutes, loadSample, loadScenarios, planRoute, savePlan, saveRoute, solve, verify } from './api'
+import { confirmRouteStep, listPlans, listRoutes, loadSample, loadScenarios, planRoute, savePlan, saveRoute, solve, verify } from './api'
 import { Chain } from './Chain'
 import type { Plan, Report, RouteReport, RouteStep, SavedRoute, Scenario, SolveRequest } from './types'
 
@@ -19,6 +19,8 @@ export default function App() {
   const [confirmedSteps, setConfirmedSteps] = useState<RouteStep[]>([])
   const [route, setRoute] = useState<RouteReport | null>(null)
   const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([])
+  const [checkDraft, setCheckDraft] = useState<Record<string, string>>({})
+  const [savedRouteId, setSavedRouteId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -45,6 +47,8 @@ export default function App() {
     setComparisons([])
     setConfirmedSteps([])
     setRoute(null)
+    setCheckDraft({})
+    setSavedRouteId(null)
     setError('')
   }
 
@@ -103,27 +107,92 @@ export default function App() {
     }
   }
 
-  async function runRoute(action: 'plan' | 'save' | 'confirm') {
+  function routeRequestPayload(confirmed: RouteStep[]) {
+    const payload = currentPayload()
+    return {
+      manifest: payload.manifest,
+      current: payload.current,
+      target: payload.target,
+      desiredVersion: payload.desiredVersion,
+      goals: payload.goals,
+      locks: payload.locks,
+      confirmed,
+    }
+  }
+
+  async function runRoute(action: 'plan' | 'save') {
     setBusy(true)
     setError('')
     try {
-      const payload = currentPayload()
-      const confirmed = action === 'confirm' && route && route.steps.length > 0
-        ? [...confirmedSteps, { ...route.steps[0], confirmed: true }]
-        : confirmedSteps
-      const request = {
-        manifest: payload.manifest,
-        current: payload.current,
-        target: payload.target,
-        desiredVersion: payload.desiredVersion,
-        goals: payload.goals,
-        locks: payload.locks,
-        confirmed,
+      const request = routeRequestPayload(confirmedSteps)
+      if (action === 'save') {
+        const saved = await saveRoute(request)
+        setSavedRouteId(saved.id)
+        setRoute(saved.report)
+        await refreshRoutes()
+        return
       }
-      const result = action === 'save' ? (await saveRoute(request)).report : await planRoute(request)
-      setConfirmedSteps(confirmed)
+      const result = await planRoute(request)
       setRoute(result)
-      if (action === 'save') await refreshRoutes()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Record the operator's check outcomes for the next planned step. Only a
+  // step whose checks were all recorded as success counts as completed;
+  // failure blocks the route with options, insufficient data keeps it pending.
+  async function confirmNext() {
+    if (!route || route.steps.length === 0) return
+    setBusy(true)
+    setError('')
+    try {
+      const step = route.steps[0]
+      const records = (step.checks ?? []).map((check) => ({
+        name: check.name,
+        result: checkDraft[check.name] ?? 'insufficient-data',
+      }))
+      if (savedRouteId) {
+        const updated = await confirmRouteStep(savedRouteId, { stepIndex: step.index, records })
+        setConfirmedSteps(updated.report.confirmedSteps ?? [])
+        setRoute(updated.report)
+        await refreshRoutes()
+      } else {
+        const confirmed = [...confirmedSteps, { ...step, executed: true, records }]
+        const result = await planRoute(routeRequestPayload(confirmed))
+        setConfirmedSteps(confirmed)
+        setRoute(result)
+      }
+      setCheckDraft({})
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // A blocked route offers three ways forward; executed conversions and
+  // their check records are never rewritten, only carried over.
+  async function chooseOption(kind: string) {
+    if (!route) return
+    if (kind === 'stop') return
+    setBusy(true)
+    setError('')
+    try {
+      let confirmed = confirmedSteps
+      if (kind === 'continue') {
+        const last = confirmed[confirmed.length - 1]
+        confirmed = [...confirmed.slice(0, -1), { ...last, acceptedFailure: true }]
+      }
+      if (kind === 'rollback') {
+        confirmed = confirmed.slice(0, -1)
+      }
+      const result = await planRoute(routeRequestPayload(confirmed))
+      setConfirmedSteps(confirmed)
+      setSavedRouteId(null)
+      setRoute(result)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -194,16 +263,44 @@ export default function App() {
         </p>
         <div className="actions">
           <button onClick={() => void runRoute('plan')} disabled={busy} className="primary">{confirmedSteps.length > 0 ? '从已完成状态继续规划' : '规划分阶段路线'}</button>
-          <button onClick={() => void runRoute('confirm')} disabled={busy || !route || route.status !== 'feasible' || route.steps.length === 0}>确认下一步</button>
           <button onClick={() => void runRoute('save')} disabled={busy || !route}>保存路线</button>
-          {confirmedSteps.length > 0 ? <button onClick={() => { setConfirmedSteps([]); setRoute(null) }} disabled={busy}>放弃已确认步骤</button> : null}
+          {confirmedSteps.length > 0 ? <button onClick={() => { setConfirmedSteps([]); setRoute(null); setSavedRouteId(null) }} disabled={busy}>放弃已确认步骤</button> : null}
         </div>
-        {route ? <RouteResult route={route} confirmedCount={confirmedSteps.length} /> : null}
+        {route && route.status === 'feasible' && route.steps.length > 0 ? (
+          <div className="card-inner">
+            <h3>第 {route.steps[0].index} 步执行后核对</h3>
+            <p className="hint">逐项记录实际核对结果；全部成功才算该步完成，资料不足会保持待确认，失败会给出可选处理方式。</p>
+            {(route.steps[0].checks ?? []).map((check) => (
+              <div key={check.name} className="check-row">
+                <div>
+                  <strong>{check.name}</strong>
+                  <p className="hint">{check.expect}</p>
+                </div>
+                <select
+                  value={checkDraft[check.name] ?? ''}
+                  onChange={(event) => setCheckDraft({ ...checkDraft, [check.name]: event.target.value })}
+                >
+                  <option value="">待记录</option>
+                  <option value="success">成功</option>
+                  <option value="failure">失败</option>
+                  <option value="insufficient-data">资料不足</option>
+                </select>
+              </div>
+            ))}
+            <button onClick={() => void confirmNext()} disabled={busy} className="primary">记录核对结果并确认该步</button>
+          </div>
+        ) : null}
+        {route ? <RouteResult route={route} confirmedCount={confirmedSteps.length} onOption={(kind) => void chooseOption(kind)} /> : null}
       </section>
 
       {comparisons.length > 0 ? <Comparison items={comparisons} /> : null}
 
-      <SavedRoutes routes={savedRoutes} />
+      <SavedRoutes routes={savedRoutes} onLoad={(saved) => {
+        setConfirmedSteps(saved.report.confirmedSteps ?? [])
+        setRoute(saved.report)
+        setSavedRouteId(saved.id)
+        setCheckDraft({})
+      }} />
 
       <SavedPlans
         plans={plans}
@@ -217,10 +314,10 @@ export default function App() {
   )
 }
 
-function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedCount: number }) {
+function RouteResult({ route, confirmedCount, onOption }: { route: RouteReport; confirmedCount: number; onOption: (kind: string) => void }) {
   return (
     <div className="route-result">
-      {route.status === 'conflict' ? (
+      {route.status === 'conflict' || route.status === 'blocked' || route.status === 'pending' ? (
         <div className="verdict conflict card-inner">
           <p className="error-text">{route.conflictMessage}</p>
           {route.remainingConflicts?.map((check, index) => (
@@ -230,6 +327,26 @@ function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedC
               <Chain links={check.chain} />
             </div>
           ))}
+          {route.pendingStep ? <p className="warning-text">第 {route.pendingStep.index} 步资料不足，保持待确认；以下剩余步骤从其之前的状态重新规划。</p> : null}
+          {route.options?.length ? (
+            <div className="compare-grid">
+              {route.options.map((option) => (
+                <div key={option.kind} className="compare-cell conflict">
+                  <h3>{option.title}</h3>
+                  {option.state ? (
+                    <div className="selection">
+                      {Object.entries(option.state).sort().map(([name, version]) => <span key={name}>{name + '@' + version}</span>)}
+                    </div>
+                  ) : null}
+                  <p className="hint">仍未解决的影响：</p>
+                  <ul className="compact">
+                    {option.unresolved?.map((item, index) => <li key={index} className="warning-text">{item}</li>)}
+                  </ul>
+                  {option.kind !== 'stop' ? <button onClick={() => onOption(option.kind)}>选择此方式</button> : <p className="hint">保持现状，不做任何改动。</p>}
+                </div>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : null}
       {route.confirmedSteps?.length ? (
@@ -238,7 +355,7 @@ function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedC
           {route.confirmedSteps.map((step) => <StepCard key={'c' + step.index} step={step} />)}
         </>
       ) : null}
-      {route.status === 'feasible' ? (
+      {route.status === 'feasible' || route.status === 'pending' ? (
         route.steps.length === 0 ? (
           <p className="success-text">目标已达成，没有剩余步骤。</p>
         ) : (
@@ -274,6 +391,27 @@ function StepCard({ step }: { step: RouteStep }) {
       </ul>
       {step.together?.length ? <p className="hint">必须一起切换：{step.together.join('、')}</p> : null}
       {step.note ? <p className="hint">{step.note}</p> : null}
+      {step.checks?.length ? (
+        <details open={!!step.records?.length}>
+          <summary>执行后核对（{step.records?.length ? '已记录' : '待记录'}）</summary>
+          <ul className="compact">
+            {step.checks.map((check) => {
+              const record = step.records?.find((item) => item.name === check.name)
+              return (
+                <li key={check.name}>
+                  {check.name}：{check.expect}
+                  {record ? (
+                    <span className={record.result === 'success' ? 'success-text' : record.result === 'failure' ? 'error-text' : 'warning-text'}>
+                      {' '}— {record.result === 'success' ? '成功' : record.result === 'failure' ? '失败' : '资料不足'}
+                    </span>
+                  ) : <span className="hint"> — 待记录</span>}
+                </li>
+              )
+            })}
+          </ul>
+          {step.acceptedFailure ? <p className="warning-text">核对失败已被操作员明确接受，路线在此状态下继续。</p> : null}
+        </details>
+      ) : null}
       <details>
         <summary>回退说明</summary>
         <p className="hint">可回退到的兼容状态：</p>
@@ -290,14 +428,14 @@ function StepCard({ step }: { step: RouteStep }) {
   )
 }
 
-function SavedRoutes({ routes }: { routes: SavedRoute[] }) {
+function SavedRoutes({ routes, onLoad }: { routes: SavedRoute[]; onLoad: (route: SavedRoute) => void }) {
   if (routes.length === 0) return null
   return (
     <section className="card saved">
       <h2>已保存路线（重开仍可解释）</h2>
-      <p className="hint">保存时冻结请求与规划结果；重新打开后仍能看到已执行步骤、每个中间状态的独立核验与剩余选择。</p>
+      <p className="hint">保存时冻结请求与规划结果；重新打开后仍能看到已执行步骤、每步核对记录、每个中间状态的独立核验与剩余选择。已执行的转换与核对记录不会被新路线覆盖。</p>
       <table>
-        <thead><tr><th>保存时间</th><th>目标</th><th>结论</th><th>已确认</th><th>剩余步骤</th><th>最终选择</th></tr></thead>
+        <thead><tr><th>保存时间</th><th>目标</th><th>结论</th><th>已执行</th><th>剩余步骤</th><th>最终选择</th><th></th></tr></thead>
         <tbody>
           {[...routes].reverse().map((route) => (
             <tr key={route.id}>
@@ -307,6 +445,7 @@ function SavedRoutes({ routes }: { routes: SavedRoute[] }) {
               <td>{route.report.confirmedSteps?.length ?? 0} 步</td>
               <td>{route.report.steps.length} 步</td>
               <td>{Object.entries(route.report.finalSelection ?? {}).map(([name, version]) => name + '@' + version).join(' ') || '—'}</td>
+              <td><button onClick={() => onLoad(route)}>载入继续核对</button></td>
             </tr>
           ))}
         </tbody>

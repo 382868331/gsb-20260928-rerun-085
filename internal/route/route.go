@@ -26,6 +26,43 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 	state := cloneMap(req.Current)
 	confirmed := make([]domain.RouteStep, 0, len(req.Confirmed))
 	for i, step := range req.Confirmed {
+		if len(step.Checks) > 0 && !step.Executed {
+			// A planned-but-not-executed step proves nothing; stop replaying
+			// and keep planning from the last genuinely completed state.
+			break
+		}
+		failed, insufficient := checkOutcome(step)
+		if failed != "" && !step.AcceptedFailure {
+			state = applyChanges(state, step.Changes)
+			step.Index = i + 1
+			step.State = cloneMap(state)
+			step.Confirmed = true
+			step.Verification = verifyState(req.Manifest, state, stepGoals(goals, state, step.Changes))
+			confirmed = append(confirmed, step)
+			return blockedReport(req, confirmed, step, failed)
+		}
+		if insufficient != "" {
+			// Not enough evidence: the step stays pending and the remaining
+			// route is planned from the state before it.
+			pending := step
+			pending.Index = i + 1
+			report := Plan(domain.RouteRequest{
+				Manifest:       req.Manifest,
+				Current:        cloneMap(state),
+				Target:         req.Target,
+				DesiredVersion: req.DesiredVersion,
+				Goals:          req.Goals,
+				Locks:          req.Locks,
+			})
+			report.Status = "pending"
+			report.ConfirmedSteps = confirmed
+			report.PendingStep = &pending
+			report.ConflictMessage = fmt.Sprintf("第 %d 步的核对 %q 资料不足：该步保持待确认，不能当作已生效", i+1, insufficient)
+			for j := range report.Steps {
+				report.Steps[j].Index = len(confirmed) + 1 + j + 1
+			}
+			return report
+		}
 		previous := cloneMap(state)
 		state = applyChanges(state, step.Changes)
 		if provided := step.State; len(provided) > 0 && !sameState(state, provided) {
@@ -290,8 +327,40 @@ func buildStep(manifest domain.Manifest, index int, state map[string]string, com
 	}
 	step.Transition = transition
 	step.Note = strings.Join(notes, "；")
+	step.Checks = plannedChecks(combo)
 	step.Verification = verifyState(manifest, next, stepGoals(goals, next, combo))
 	return step
+}
+
+// plannedChecks attaches the verifications an operator must record after
+// executing a step: startup health for every changed component, plus data
+// migration or re-attachment checks for irreversible conversions.
+func plannedChecks(combo []domain.Change) []domain.StepCheck {
+	checks := []domain.StepCheck{}
+	for _, change := range combo {
+		if change.To == "" {
+			checks = append(checks, domain.StepCheck{
+				Name:   change.Component + " 退出核对",
+				Expect: change.Component + " 的数据与配置已备份，或已确认可由后续组件重新接入",
+			})
+			continue
+		}
+		checks = append(checks, domain.StepCheck{
+			Name:   change.Component + " 启动核对",
+			Expect: change.Component + "@" + change.To + " 启动并通过健康检查",
+		})
+		if change.From != "" {
+			from, errFrom := semver.Parse(change.From)
+			to, errTo := semver.Parse(change.To)
+			if errFrom == nil && errTo == nil && to.Major > from.Major {
+				checks = append(checks, domain.StepCheck{
+					Name:   change.Component + " 数据迁移核对",
+					Expect: fmt.Sprintf("%s %s → %s 的一次性数据转换已完成且旧数据可读取；该转换不可直接撤销", change.Component, change.From, change.To),
+				})
+			}
+		}
+	}
+	return checks
 }
 
 // stepGoals verifies an intermediate state against the final goals it already
@@ -317,6 +386,71 @@ func stepGoals(goals []domain.MigrationGoal, state map[string]string, changes []
 
 func verifyState(manifest domain.Manifest, state map[string]string, goals []domain.MigrationGoal) domain.Report {
 	return verifier.VerifyRequest(domain.SolveRequest{Manifest: manifest, Goals: goals}, state)
+}
+
+// checkOutcome inspects the operator records of an executed step and returns
+// the first failed check name and the first check name whose evidence is
+// missing or marked insufficient-data.
+func checkOutcome(step domain.RouteStep) (failed string, insufficient string) {
+	results := map[string]string{}
+	for _, record := range step.Records {
+		results[record.Name] = record.Result
+	}
+	for _, check := range step.Checks {
+		switch results[check.Name] {
+		case "failure":
+			if failed == "" {
+				failed = check.Name
+			}
+		case "success":
+		default:
+			if insufficient == "" {
+				insufficient = check.Name
+			}
+		}
+	}
+	return failed, insufficient
+}
+
+// blockedReport explains the choices once an executed step's check failed:
+// keep the current state and fix the remaining route, fall back to the last
+// compatible state, or stop — each with the impacts it does not resolve.
+func blockedReport(req domain.RouteRequest, confirmed []domain.RouteStep, step domain.RouteStep, failed string) domain.RouteReport {
+	irreversible := append([]string{}, step.Rollback.Irreversible...)
+	unresolvedContinue := append([]string{fmt.Sprintf("核对 %q 记录为失败，问题本身仍未解决", failed)}, irreversible...)
+	unresolvedStop := append([]string{}, unresolvedContinue...)
+	unresolvedRollback := append([]string{}, irreversible...)
+	if len(unresolvedRollback) == 0 {
+		unresolvedRollback = append(unresolvedRollback, "回退只恢复版本选择，执行期间产生的其他副作用需人工确认")
+	}
+	return domain.RouteReport{
+		Status:         "blocked",
+		ResumedFrom:    cloneMap(step.State),
+		ConfirmedSteps: confirmed,
+		Steps:          []domain.RouteStep{},
+		ConflictMessage: fmt.Sprintf("第 %d 步已执行且包含不可直接撤回的转换，核对 %q 失败：版本回退不会撤销已发生的数据转换",
+			step.Index, failed),
+		Options: []domain.RouteOption{
+			{
+				Kind:       "continue",
+				Title:      "保留当前状态，修正后续路线",
+				State:      cloneMap(step.State),
+				Unresolved: unresolvedContinue,
+			},
+			{
+				Kind:       "rollback",
+				Title:      "回到仍兼容的旧状态（仅恢复版本选择）",
+				State:      cloneMap(step.Rollback.State),
+				Unresolved: unresolvedRollback,
+			},
+			{
+				Kind:       "stop",
+				Title:      "停止处理，保留现场等待人工决策",
+				State:      cloneMap(step.State),
+				Unresolved: unresolvedStop,
+			},
+		},
+	}
 }
 
 func remainingConflicts(manifest domain.Manifest, state map[string]string, pending []domain.Change) []domain.Check {

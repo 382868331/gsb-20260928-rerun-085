@@ -59,4 +59,7 @@ th { color: #60708a; font-size: 12px; text-transform: uppercase; letter-spacing:
 .step-card h3 { margin: 0 0 6px; font-size: 14px; }
 .step-card details { margin-top: 8px; }
 .step-card summary { cursor: pointer; color: #4f46e5; font-weight: 700; }
+.check-row { display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 8px 0; border-bottom: 1px dashed #e2e8f0; }
+.check-row p { margin: 2px 0; }
+.check-row select { min-width: 140px; }
 @media (max-width: 980px) { .grid, .result-grid { grid-template-columns: 1fr; } textarea { min-height: 360px; } header { align-items: flex-start; flex-direction: column; } }

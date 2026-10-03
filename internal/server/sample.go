@@ -159,6 +159,29 @@ func scenarios() []Scenario {
 			},
 		},
 		{
+			ID:          "mid-lock",
+			Name:        "中途锁定组件：剩余路线随之改变",
+			Description: "以 app 3.0.0 为目标规划并确认第一步（app 2.0.0 + lib 2.0.0）后，把 lib 锁定在 2.0.0；app 3.0.0 要求 lib ^3.0.0，路线必须报告剩余冲突而不是推翻已执行步骤。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^3.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+					}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "3.0.0",
+				Locks:          map[string]string{},
+			},
+		},
+		{
 			ID:          "goal-change",
 			Name:        "中途改变目标：从已完成状态继续",
 			Description: "先以 app 3.0.0 为目标规划并确认第一步（app 2.0.0 + lib 2.0.0），再把目标改成 app 2.0.0 或锁定 lib；后续计划只从已完成状态继续，历史步骤保持原样。",
