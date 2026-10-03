@@ -376,3 +376,144 @@ func TestRouteSaveAndReloadKeepsHistory(t *testing.T) {
 		t.Fatalf("saved route must keep per-step verification, got %+v", routes[0].Report.Steps)
 	}
 }
+
+func TestRouteSaveIsIdempotentAcrossInterruption(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	payload := routeRequestFrom(sample)
+	status, first := do(t, handler, http.MethodPost, "/api/routes", payload)
+	if status != http.StatusCreated {
+		t.Fatalf("first save status %d", status)
+	}
+	// Simulate a save interrupted after the record was written: the client
+	// retries the identical request and must get the same record back
+	// instead of executing the one-time transformations again.
+	status, second := do(t, handler, http.MethodPost, "/api/routes", payload)
+	if status != http.StatusOK {
+		t.Fatalf("retry status %d, want 200", status)
+	}
+	if first["id"] != second["id"] {
+		t.Fatalf("retry must return the original record, got %v vs %v", first["id"], second["id"])
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var routes []domain.SavedRoute
+	if err := json.Unmarshal(rec.Body.Bytes(), &routes); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("interrupted save must not duplicate the route, got %d", len(routes))
+	}
+}
+
+func TestRouteConfirmRecordsChecksOnce(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	report := saved["report"].(map[string]any)
+	steps, _ := report["steps"].([]any)
+	if len(steps) == 0 {
+		t.Fatalf("expected planned steps, got %v", report)
+	}
+	first := steps[0].(map[string]any)
+	checks, _ := first["checks"].([]any)
+	if len(checks) == 0 {
+		t.Fatalf("planned step must carry checks, got %v", first)
+	}
+	recorded := []map[string]any{}
+	for _, item := range checks {
+		check := item.(map[string]any)
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": "success"})
+	}
+	confirm := map[string]any{"routeId": routeID, "stepIndex": 1, "checks": recorded}
+	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/confirm", confirm)
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, confirmed)
+	}
+	confirmedReport := confirmed["report"].(map[string]any)
+	confirmedSteps, _ := confirmedReport["confirmedSteps"].([]any)
+	if len(confirmedSteps) != 1 {
+		t.Fatalf("step must move into confirmed history, got %v", confirmedReport)
+	}
+	// Idempotent retry after an interrupted save: same record, no duplicate.
+	status, again := do(t, handler, http.MethodPost, "/api/routes/confirm", confirm)
+	if status != http.StatusOK {
+		t.Fatalf("idempotent retry status %d: %v", status, again)
+	}
+	againReport := again["report"].(map[string]any)
+	againSteps, _ := againReport["confirmedSteps"].([]any)
+	if len(againSteps) != 1 {
+		t.Fatalf("retry must not duplicate the executed step, got %v", againReport)
+	}
+	// A different record for the same executed step is rejected: history
+	// cannot be overwritten by a new route.
+	changed := []map[string]any{}
+	for _, item := range recorded {
+		changed = append(changed, map[string]any{"id": item["id"], "label": item["label"], "status": "failed"})
+	}
+	status, conflict := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": changed,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("overwriting recorded checks must fail, got %d: %v", status, conflict)
+	}
+	// Replanning resumes from the truly completed state only.
+	replanPayload := routeRequestFrom(sample)
+	replanPayload["confirmed"] = confirmedReport["confirmedSteps"]
+	status, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
+	if status != http.StatusOK {
+		t.Fatalf("replan status %d", status)
+	}
+	resumed, _ := replanned["resumedFrom"].(map[string]any)
+	if resumed["app"] != "2.0.0" {
+		t.Fatalf("planning must resume from the verified state, got %v", resumed)
+	}
+}
+
+func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	report := saved["report"].(map[string]any)
+	steps, _ := report["steps"].([]any)
+	first := steps[0].(map[string]any)
+	checks, _ := first["checks"].([]any)
+	recorded := []map[string]any{}
+	for _, item := range checks {
+		check := item.(map[string]any)
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": "insufficient"})
+	}
+	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": recorded,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, confirmed)
+	}
+	confirmedReport := confirmed["report"].(map[string]any)
+	confirmedSteps, _ := confirmedReport["confirmedSteps"].([]any)
+	if len(confirmedSteps) != 1 {
+		t.Fatalf("record must be preserved even when insufficient, got %v", confirmedReport)
+	}
+	// Replanning must not treat the step as done: it stays held and the
+	// route resumes from the state before it.
+	replanPayload := routeRequestFrom(sample)
+	replanPayload["confirmed"] = confirmedReport["confirmedSteps"]
+	_, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
+	held, _ := replanned["heldSteps"].([]any)
+	if len(held) != 1 {
+		t.Fatalf("insufficient checks must keep the step held, got %v", replanned)
+	}
+	resumed, _ := replanned["resumedFrom"].(map[string]any)
+	if resumed["app"] != "1.0.0" {
+		t.Fatalf("planning must resume from the truly completed state, got %v", resumed)
+	}
+}

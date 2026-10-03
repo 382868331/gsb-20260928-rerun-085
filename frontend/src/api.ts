@@ -1,4 +1,4 @@
-import type { Manifest, Plan, Report, RouteReport, RouteRequest, SavedRoute, Scenario, SolveRequest } from './types'
+import type { ConfirmRequest, Manifest, Plan, Report, RouteReport, RouteRequest, SavedRoute, Scenario, SolveRequest } from './types'
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options })
@@ -17,3 +17,5 @@ export const verify = (payload: SolveRequest, selection: Record<string, string>)
 export const planRoute = (payload: RouteRequest) => request<RouteReport>('/api/route/plan', { method: 'POST', body: JSON.stringify(payload) })
 export const saveRoute = (payload: RouteRequest) => request<SavedRoute>('/api/routes', { method: 'POST', body: JSON.stringify(payload) })
 export const listRoutes = () => request<SavedRoute[]>('/api/routes')
+export const confirmRouteStep = (payload: ConfirmRequest) =>
+  request<SavedRoute>('/api/routes/confirm', { method: 'POST', body: JSON.stringify(payload) })

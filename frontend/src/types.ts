@@ -41,6 +41,7 @@ export type Plan = {
   createdAt: string
 }
 export type RollbackInfo = { state: Record<string, string>; irreversible?: string[] }
+export type StepCheck = { id: string; label: string; status: 'pending' | 'success' | 'failed' | 'insufficient' | string; note?: string }
 export type RouteStep = {
   index: number
   changes: Change[]
@@ -48,10 +49,13 @@ export type RouteStep = {
   together?: string[]
   transition?: string[]
   note?: string
+  checks?: StepCheck[]
   verification: Report
   rollback: RollbackInfo
   confirmed?: boolean
+  effective?: boolean
 }
+export type RouteOption = { kind: 'continue' | 'rollback' | 'stop' | string; summary: string; state: Record<string, string>; impacts: string[] }
 export type RouteRequest = {
   manifest: Manifest
   current: Record<string, string>
@@ -65,14 +69,18 @@ export type RouteReport = {
   status: 'feasible' | 'conflict' | string
   resumedFrom: Record<string, string>
   confirmedSteps?: RouteStep[]
+  heldSteps?: RouteStep[]
   steps: RouteStep[]
   finalSelection?: Record<string, string>
   conflictMessage?: string
   remainingConflicts?: Check[]
+  options?: RouteOption[]
 }
 export type SavedRoute = {
   id: string
+  fingerprint?: string
   request: RouteRequest
   report: RouteReport
   createdAt: string
 }
+export type ConfirmRequest = { routeId: string; stepIndex: number; checks: StepCheck[] }

@@ -115,3 +115,49 @@ func (s *RouteStore) Save(route domain.SavedRoute) error {
 	}
 	return os.WriteFile(s.path, append(encoded, '\n'), 0o644)
 }
+
+// FindByFingerprint returns the stored route saved from an identical
+// request, so an interrupted save retried later does not duplicate the
+// record of one-time transformations.
+func (s *RouteStore) FindByFingerprint(fingerprint string) (domain.SavedRoute, bool, error) {
+	routes, err := s.List()
+	if err != nil {
+		return domain.SavedRoute{}, false, err
+	}
+	for _, route := range routes {
+		if route.Fingerprint != "" && route.Fingerprint == fingerprint {
+			return route, true, nil
+		}
+	}
+	return domain.SavedRoute{}, false, nil
+}
+
+// Update replaces the stored route with the same ID. Confirmed steps and
+// their check records already present are the caller's responsibility: this
+// only persists what it is given.
+func (s *RouteStore) Update(updated domain.SavedRoute) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	routes := []domain.SavedRoute{}
+	content, err := os.ReadFile(s.path)
+	if err == nil && len(content) > 0 {
+		if err := json.Unmarshal(content, &routes); err != nil {
+			return err
+		}
+	}
+	found := false
+	for i, route := range routes {
+		if route.ID == updated.ID {
+			routes[i] = updated
+			found = true
+		}
+	}
+	if !found {
+		return errors.New("route not found: " + updated.ID)
+	}
+	encoded, err := json.MarshalIndent(routes, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(s.path, append(encoded, '\n'), 0o644)
+}

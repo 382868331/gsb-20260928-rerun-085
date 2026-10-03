@@ -98,9 +98,35 @@ type RouteStep struct {
 	Together     []string          `json:"together,omitempty"`
 	Transition   []string          `json:"transition,omitempty"`
 	Note         string            `json:"note,omitempty"`
+	Checks       []StepCheck       `json:"checks,omitempty"`
 	Verification Report            `json:"verification"`
 	Rollback     RollbackInfo      `json:"rollback"`
 	Confirmed    bool              `json:"confirmed,omitempty"`
+	// Effective is true only when the step was confirmed AND every attached
+	// check was recorded as a success by the user. A plan claiming success
+	// is never enough on its own.
+	Effective bool `json:"effective,omitempty"`
+}
+
+// StepCheck is a verification the user must perform after executing a step.
+// Status is one of pending, success, failed or insufficient (资料不足).
+// Recorded outcomes are append-only: a new route must never overwrite them.
+type StepCheck struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Status string `json:"status"`
+	Note   string `json:"note,omitempty"`
+}
+
+// RouteOption is one way forward when a route stalls or a check fails.
+// Kind is continue (keep current state and fix the remaining route),
+// rollback (return to a still-compatible old state) or stop (halt here).
+// Impacts lists what each choice still leaves unresolved.
+type RouteOption struct {
+	Kind    string            `json:"kind"`
+	Summary string            `json:"summary"`
+	State   map[string]string `json:"state"`
+	Impacts []string          `json:"impacts"`
 }
 
 // RollbackInfo describes the compatible state a step can fall back to and
@@ -127,15 +153,30 @@ type RouteReport struct {
 	Status             string            `json:"status"`
 	ResumedFrom        map[string]string `json:"resumedFrom"`
 	ConfirmedSteps     []RouteStep       `json:"confirmedSteps,omitempty"`
+	// HeldSteps are confirmed steps whose checks are not all successful;
+	// they are preserved verbatim but planning does not treat them as done.
+	HeldSteps          []RouteStep       `json:"heldSteps,omitempty"`
 	Steps              []RouteStep       `json:"steps"`
 	FinalSelection     map[string]string `json:"finalSelection,omitempty"`
 	ConflictMessage    string            `json:"conflictMessage,omitempty"`
 	RemainingConflicts []Check           `json:"remainingConflicts,omitempty"`
+	Options            []RouteOption     `json:"options,omitempty"`
 }
 
 type SavedRoute struct {
-	ID        string       `json:"id"`
-	Request   RouteRequest `json:"request"`
-	Report    RouteReport  `json:"report"`
-	CreatedAt string       `json:"createdAt"`
+	ID          string       `json:"id"`
+	Fingerprint string       `json:"fingerprint,omitempty"`
+	Request     RouteRequest `json:"request"`
+	Report      RouteReport  `json:"report"`
+	CreatedAt   string       `json:"createdAt"`
+}
+
+// ConfirmRequest records the user's check outcomes for one step of a saved
+// route. Re-sending the identical record is a no-op (save interruptions must
+// not re-execute one-time transformations); a different record for the same
+// step is rejected because executed history cannot be overwritten.
+type ConfirmRequest struct {
+	RouteID   string      `json:"routeId"`
+	StepIndex int         `json:"stepIndex"`
+	Checks    []StepCheck `json:"checks"`
 }

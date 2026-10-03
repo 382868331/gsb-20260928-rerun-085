@@ -181,6 +181,52 @@ func scenarios() []Scenario {
 				Locks:          map[string]string{},
 			},
 		},
+		{
+			ID:          "check-failure",
+			Name:        "核对失败：从真实状态比较选择",
+			Description: "第一步 app 1.0.0 → 2.0.0 跨大版本并触发数据迁移（不可直接撤销）。执行后把核对记为失败或资料不足，后续规划只从真实已完成状态继续，并比较保留当前状态修正路线、回到仍兼容的旧状态、停止处理三种选择各自未解决的影响。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^3.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: ">=2.0.0"}}},
+					}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "3.0.0",
+				Locks:          map[string]string{},
+			},
+		},
+		{
+			ID:          "mid-lock",
+			Name:        "中途锁定组件：剩余冲突可解释",
+			Description: "先规划并确认第一步（app 2.0.0 + lib 2.0.0），再在锁定框加入 {\"lib\": \"2.0.0\"} 重新规划：app 3.0.0 要求 lib ^3.0.0 而无法继续；报告列出剩余冲突，并给出保留当前状态继续、回退到仍兼容旧状态、停止处理三种选择及各自未解决的影响。",
+			Request: domain.SolveRequest{
+				Manifest: domain.Manifest{Components: []domain.Component{
+					{Name: "app", Versions: []domain.Version{
+						{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^3.0.0"}}},
+					}},
+					{Name: "lib", Versions: []domain.Version{
+						{Version: "1.0.0"},
+						{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+						{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: ">=2.0.0"}}},
+					}},
+				}},
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "3.0.0",
+				Locks:          map[string]string{},
+			},
+		},
 	}
 }
 

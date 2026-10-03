@@ -2,10 +2,12 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io/fs"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -30,6 +32,7 @@ func New(planStore *store.Store, routeStore *store.RouteStore, static fs.FS) *Se
 	s.mux.HandleFunc("/api/solve", s.handleSolve)
 	s.mux.HandleFunc("/api/route/plan", s.handleRoutePlan)
 	s.mux.HandleFunc("/api/routes", s.handleRoutes)
+	s.mux.HandleFunc("/api/routes/confirm", s.handleRouteConfirm)
 	s.mux.HandleFunc("/api/plans/verify", s.handleVerify)
 	s.mux.HandleFunc("/api/plans", s.handlePlans)
 	s.mux.HandleFunc("/", s.handleStatic)
@@ -98,12 +101,24 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		fingerprint := fingerprintOf(req)
+		if existing, found, err := s.routes.FindByFingerprint(fingerprint); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		} else if found {
+			// Saving the same route again (e.g. after an interrupted save)
+			// returns the original record instead of duplicating one-time
+			// transformations.
+			writeJSON(w, http.StatusOK, existing)
+			return
+		}
 		report := route.Plan(req)
 		saved := domain.SavedRoute{
-			ID:        newID(),
-			Request:   req,
-			Report:    report,
-			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+			ID:          newID(),
+			Fingerprint: fingerprint,
+			Request:     req,
+			Report:      report,
+			CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		}
 		if err := s.routes.Save(saved); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -113,6 +128,131 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "GET or POST required")
 	}
+}
+
+// handleRouteConfirm records the user's check outcomes for one step of a
+// saved route. Re-sending the identical record is a no-op; a different
+// record for an already-recorded step is rejected because executed
+// transformations and their verification records cannot be overwritten by
+// a new route.
+func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
+	if s.routes == nil {
+		writeError(w, http.StatusServiceUnavailable, "route store is not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var payload domain.ConfirmRequest
+	if err := decode(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	routes, err := s.routes.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var saved *domain.SavedRoute
+	for i := range routes {
+		if routes[i].ID == payload.RouteID {
+			saved = &routes[i]
+		}
+	}
+	if saved == nil {
+		writeError(w, http.StatusNotFound, "unknown route")
+		return
+	}
+	step := findStep(saved, payload.StepIndex)
+	if step == nil {
+		writeError(w, http.StatusNotFound, "unknown step")
+		return
+	}
+	if recorded(step.Checks) {
+		if reflect.DeepEqual(normalizeChecks(step.Checks), normalizeChecks(payload.Checks)) {
+			// Idempotent retry after an interrupted save: nothing is
+			// executed again, the stored record is returned as-is.
+			writeJSON(w, http.StatusOK, *saved)
+			return
+		}
+		writeError(w, http.StatusConflict, "该步骤的核对记录已存在，不能被新记录覆盖")
+		return
+	}
+	for _, check := range payload.Checks {
+		switch check.Status {
+		case "success", "failed", "insufficient":
+		default:
+			writeError(w, http.StatusBadRequest, "check status must be success, failed or insufficient")
+			return
+		}
+	}
+	if len(payload.Checks) != len(step.Checks) {
+		writeError(w, http.StatusBadRequest, "must record an outcome for every attached check")
+		return
+	}
+	step.Checks = append([]domain.StepCheck{}, payload.Checks...)
+	allSuccess := true
+	for _, check := range step.Checks {
+		if check.Status != "success" {
+			allSuccess = false
+		}
+	}
+	step.Confirmed = true
+	step.Effective = allSuccess
+	// Move the step out of the planned list into the executed history,
+	// keeping its check record verbatim for any later route.
+	remaining := []domain.RouteStep{}
+	for _, item := range saved.Report.Steps {
+		if item.Index != payload.StepIndex {
+			remaining = append(remaining, item)
+		}
+	}
+	saved.Report.Steps = remaining
+	saved.Report.ConfirmedSteps = append(saved.Report.ConfirmedSteps, *step)
+	saved.Request.Confirmed = append(saved.Request.Confirmed, *step)
+	if err := s.routes.Update(*saved); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, *saved)
+}
+
+func findStep(saved *domain.SavedRoute, index int) *domain.RouteStep {
+	for i := range saved.Report.ConfirmedSteps {
+		if saved.Report.ConfirmedSteps[i].Index == index {
+			return &saved.Report.ConfirmedSteps[i]
+		}
+	}
+	for i := range saved.Report.Steps {
+		if saved.Report.Steps[i].Index == index {
+			return &saved.Report.Steps[i]
+		}
+	}
+	return nil
+}
+
+func recorded(checks []domain.StepCheck) bool {
+	for _, check := range checks {
+		if check.Status != "pending" && check.Status != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeChecks(checks []domain.StepCheck) []domain.StepCheck {
+	out := make([]domain.StepCheck, 0, len(checks))
+	for _, check := range checks {
+		out = append(out, domain.StepCheck{ID: check.ID, Status: check.Status, Note: check.Note})
+	}
+	return out
+}
+
+func fingerprintOf(req domain.RouteRequest) string {
+	encoded, _ := json.Marshal(req)
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
 }
 
 type verifyRequest struct {

@@ -127,7 +127,11 @@ func TestConfirmedStepsAreKeptAndPlanningResumes(t *testing.T) {
 	if initial.Status != "feasible" || len(initial.Steps) == 0 {
 		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
 	}
-	confirmed := []domain.RouteStep{initial.Steps[0]}
+	done := initial.Steps[0]
+	for i := range done.Checks {
+		done.Checks[i].Status = "success"
+	}
+	confirmed := []domain.RouteStep{done}
 
 	// Mid-way goal change: app 3.0.0 -> app 2.0.0 after the first step.
 	replanned := Plan(domain.RouteRequest{
@@ -197,6 +201,7 @@ func TestConfirmedStepInconsistentWithCurrentState(t *testing.T) {
 		Index:   1,
 		Changes: []domain.Change{{Component: "app", From: "1.0.0", To: "2.0.0"}},
 		State:   map[string]string{"app": "2.0.0", "lib": "9.9.9"},
+		Checks:  []domain.StepCheck{{ID: "c1", Label: "核对", Status: "success"}},
 	}
 	report := Plan(domain.RouteRequest{
 		Manifest:       mutualManifest(),
@@ -207,5 +212,146 @@ func TestConfirmedStepInconsistentWithCurrentState(t *testing.T) {
 	})
 	if report.Status != "conflict" {
 		t.Fatalf("forged history must be rejected, got %s", report.Status)
+	}
+}
+
+func TestPlannedStepsCarryPendingChecks(t *testing.T) {
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "2.0.0",
+	})
+	if report.Status != "feasible" {
+		t.Fatalf("expected feasible, got %s", report.Status)
+	}
+	for _, step := range report.Steps {
+		if len(step.Checks) == 0 {
+			t.Fatalf("planned step %d must carry checks to record, got %+v", step.Index, step)
+		}
+		for _, check := range step.Checks {
+			if check.Status != "pending" {
+				t.Fatalf("fresh checks must start pending, got %q", check.Status)
+			}
+		}
+	}
+}
+
+func TestUnrecordedOrFailedChecksHoldTheStep(t *testing.T) {
+	initial := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if initial.Status != "feasible" || len(initial.Steps) != 2 {
+		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
+	}
+	cases := []struct {
+		name   string
+		checks []domain.StepCheck
+	}{
+		{"pending", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "pending"}}},
+		{"failed", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "failed"}}},
+		{"insufficient", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "insufficient"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			step := initial.Steps[0]
+			step.Checks = tc.checks
+			report := Plan(domain.RouteRequest{
+				Manifest:       mutualManifest(),
+				Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+				Target:         "app",
+				DesiredVersion: "3.0.0",
+				Confirmed:      []domain.RouteStep{step},
+			})
+			if len(report.ConfirmedSteps) != 0 {
+				t.Fatalf("step without successful checks must not count as done, got %+v", report.ConfirmedSteps)
+			}
+			if len(report.HeldSteps) != 1 || report.HeldSteps[0].Effective {
+				t.Fatalf("step must be held with its record preserved, got %+v", report.HeldSteps)
+			}
+			if report.ResumedFrom["app"] != "1.0.0" {
+				t.Fatalf("planning must resume from the truly completed state, got %v", report.ResumedFrom)
+			}
+			if len(report.Steps) != 2 {
+				t.Fatalf("remaining route must be replanned from the real state, got %+v", report.Steps)
+			}
+		})
+	}
+}
+
+func TestOptionsExplainUnresolvedImpacts(t *testing.T) {
+	manifest := domain.Manifest{Components: []domain.Component{
+		{Name: "app", Versions: []domain.Version{
+			{Version: "1.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^1.0.0"}}},
+			{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^2.0.0"}}},
+			{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "lib", Constraint: "^3.0.0"}}},
+		}},
+		{Name: "lib", Versions: []domain.Version{
+			{Version: "1.0.0"},
+			{Version: "2.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: "^2.0.0"}}},
+			{Version: "3.0.0", Requirements: []domain.Requirement{{Component: "app", Constraint: ">=2.0.0"}}},
+		}},
+	}}
+	initial := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if initial.Status != "feasible" || len(initial.Steps) == 0 {
+		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
+	}
+	done := initial.Steps[0]
+	for i := range done.Checks {
+		done.Checks[i].Status = "success"
+	}
+	report := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Locks:          map[string]string{"lib": "2.0.0"},
+		Confirmed:      []domain.RouteStep{done},
+	})
+	if report.Status != "conflict" {
+		t.Fatalf("locking lib 2.0.0 must block app 3.0.0, got %s", report.Status)
+	}
+	if len(report.Options) < 2 {
+		t.Fatalf("expected continue/stop/rollback options, got %+v", report.Options)
+	}
+	byKind := map[string]domain.RouteOption{}
+	for _, option := range report.Options {
+		byKind[option.Kind] = option
+		if len(option.Impacts) == 0 {
+			t.Fatalf("option %s must list unresolved impacts", option.Kind)
+		}
+	}
+	cont, ok := byKind["continue"]
+	if !ok || cont.State["app"] != "2.0.0" {
+		t.Fatalf("continue must keep the current executed state, got %+v", cont)
+	}
+	joined := ""
+	for _, impact := range cont.Impacts {
+		joined += impact
+	}
+	if !strings.Contains(joined, "数据迁移") && !strings.Contains(joined, "不可") {
+		t.Fatalf("continue impacts must mention irreversible data migration, got %v", cont.Impacts)
+	}
+	rollback, ok := byKind["rollback"]
+	if !ok || rollback.State["app"] != "1.0.0" {
+		t.Fatalf("rollback must return to the still-compatible old state, got %+v", rollback)
+	}
+	rollbackJoined := ""
+	for _, impact := range rollback.Impacts {
+		rollbackJoined += impact
+	}
+	if !strings.Contains(rollbackJoined, "数据转换") {
+		t.Fatalf("rollback impacts must explain data transforms are not undone, got %v", rollback.Impacts)
+	}
+	if _, ok := byKind["stop"]; !ok {
+		t.Fatalf("stop option must be offered, got %+v", report.Options)
 	}
 }
