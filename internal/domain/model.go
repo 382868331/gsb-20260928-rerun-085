@@ -118,6 +118,13 @@ type StepCheck struct {
 	Note   string `json:"note,omitempty"`
 }
 
+// CheckRecord ties one recorded check conclusion to the step it belongs to,
+// so conclusions are stored separately from the plan itself.
+type CheckRecord struct {
+	StepIndex int       `json:"stepIndex"`
+	Check     StepCheck `json:"check"`
+}
+
 // RouteOption is one way forward when a route stalls or a check fails.
 // Kind is continue (keep current state and fix the remaining route),
 // rollback (return to a still-compatible old state) or stop (halt here).
@@ -150,9 +157,9 @@ type RouteRequest struct {
 }
 
 type RouteReport struct {
-	Status             string            `json:"status"`
-	ResumedFrom        map[string]string `json:"resumedFrom"`
-	ConfirmedSteps     []RouteStep       `json:"confirmedSteps,omitempty"`
+	Status         string            `json:"status"`
+	ResumedFrom    map[string]string `json:"resumedFrom"`
+	ConfirmedSteps []RouteStep       `json:"confirmedSteps,omitempty"`
 	// HeldSteps are confirmed steps whose checks are not all successful;
 	// they are preserved verbatim but planning does not treat them as done.
 	HeldSteps          []RouteStep       `json:"heldSteps,omitempty"`
@@ -168,7 +175,17 @@ type SavedRoute struct {
 	Fingerprint string       `json:"fingerprint,omitempty"`
 	Request     RouteRequest `json:"request"`
 	Report      RouteReport  `json:"report"`
-	CreatedAt   string       `json:"createdAt"`
+	// Executed holds the component versions actually in effect after the
+	// effective confirmed steps. Planned-only versions never appear here.
+	Executed map[string]string `json:"executed,omitempty"`
+	// Conclusions stores every recorded check outcome separately from the
+	// plan, so a new route can never rewrite the verification history.
+	Conclusions []CheckRecord `json:"conclusions,omitempty"`
+	// Irreversible lists one-time impacts (data conversions, component
+	// exits) from every executed step, including steps whose checks did
+	// not pass: a failed check does not undo a data transformation.
+	Irreversible []string `json:"irreversible,omitempty"`
+	CreatedAt    string   `json:"createdAt"`
 }
 
 // ConfirmRequest records the user's check outcomes for one step of a saved

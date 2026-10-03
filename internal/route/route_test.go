@@ -355,3 +355,76 @@ func TestOptionsExplainUnresolvedImpacts(t *testing.T) {
 		t.Fatalf("stop option must be offered, got %+v", report.Options)
 	}
 }
+
+// The options of a feasible plan describe the way forward from the state
+// that has really been executed. They must never present the planned final
+// selection as if it were the current actual state.
+func TestFeasiblePlanOptionsShowExecutedStateNotFinalPlan(t *testing.T) {
+	report := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if report.Status != "feasible" {
+		t.Fatalf("expected feasible, got %s", report.Status)
+	}
+	if report.FinalSelection["app"] != "3.0.0" {
+		t.Fatalf("final plan should reach 3.0.0, got %v", report.FinalSelection)
+	}
+	if len(report.Options) == 0 {
+		t.Fatalf("options must be offered, got %+v", report)
+	}
+	for _, option := range report.Options {
+		if option.Kind == "rollback" {
+			continue
+		}
+		if option.State["app"] != "1.0.0" {
+			t.Fatalf("option %s shows planned version as current state: %+v", option.Kind, option.State)
+		}
+	}
+}
+
+// A step that was executed but whose checks failed is held: planning does
+// not count it as done, yet its one-time data transformations already
+// happened and must show up in every way forward.
+func TestHeldStepIrreversibleImpactsAreKeptInOptions(t *testing.T) {
+	initial := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+	})
+	if initial.Status != "feasible" || len(initial.Steps) == 0 {
+		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
+	}
+	held := initial.Steps[0]
+	if len(held.Rollback.Irreversible) == 0 {
+		t.Fatalf("cross-major step must carry irreversible impacts, got %+v", held)
+	}
+	for i := range held.Checks {
+		held.Checks[i].Status = "failed"
+	}
+	replanned := Plan(domain.RouteRequest{
+		Manifest:       mutualManifest(),
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{held},
+	})
+	if len(replanned.HeldSteps) != 1 {
+		t.Fatalf("failed checks must keep the step held, got %+v", replanned.HeldSteps)
+	}
+	if len(replanned.Options) == 0 {
+		t.Fatalf("options must be offered for a route with held steps")
+	}
+	for _, option := range replanned.Options {
+		joined := ""
+		for _, impact := range option.Impacts {
+			joined += impact
+		}
+		if !strings.Contains(joined, "数据迁移") {
+			t.Fatalf("option %s must keep the executed data transformation visible, got %v", option.Kind, option.Impacts)
+		}
+	}
+}

@@ -81,6 +81,9 @@ export type SavedRoute = {
   fingerprint?: string
   request: RouteRequest
   report: RouteReport
+  executed?: Record<string, string>
+  conclusions?: Array<{ stepIndex: number; check: StepCheck }>
+  irreversible?: string[]
   createdAt: string
 }
 export type ConfirmRequest = { routeId: string; stepIndex: number; checks: StepCheck[] }

@@ -517,3 +517,199 @@ func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 		t.Fatalf("planning must resume from the truly completed state, got %v", resumed)
 	}
 }
+
+// 资料补录: checks recorded as insufficient may be filled in later; final
+// outcomes (success/failed) are append-only and contradictions are 409.
+func TestRouteConfirmSupplementsInsufficientChecksOnly(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	steps, _ := saved["report"].(map[string]any)["steps"].([]any)
+	checks, _ := steps[0].(map[string]any)["checks"].([]any)
+	if len(checks) < 2 {
+		t.Fatalf("need at least two checks to test partial supplement, got %v", checks)
+	}
+	mixed := []map[string]any{}
+	for i, item := range checks {
+		check := item.(map[string]any)
+		outcome := "success"
+		if i == len(checks)-1 {
+			outcome = "insufficient"
+		}
+		mixed = append(mixed, map[string]any{"id": check["id"], "label": check["label"], "status": outcome})
+	}
+	status, _ = do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": mixed,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("initial record status %d", status)
+	}
+	// Supplement only the insufficient check; the step now becomes effective.
+	supplemented := []map[string]any{}
+	for _, item := range mixed {
+		outcome := item["status"]
+		if outcome == "insufficient" {
+			outcome = "success"
+		}
+		supplemented = append(supplemented, map[string]any{"id": item["id"], "label": item["label"], "status": outcome})
+	}
+	status, updated := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": supplemented,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("supplement status %d: %v", status, updated)
+	}
+	confirmedSteps, _ := updated["report"].(map[string]any)["confirmedSteps"].([]any)
+	if len(confirmedSteps) != 1 {
+		t.Fatalf("supplement must not duplicate the step, got %v", updated["report"])
+	}
+	if effective, _ := confirmedSteps[0].(map[string]any)["effective"].(bool); !effective {
+		t.Fatalf("fully successful checks must make the step effective, got %v", confirmedSteps[0])
+	}
+	// A recorded success can never be rewritten by a contradictory record.
+	contradicting := []map[string]any{}
+	for i, item := range supplemented {
+		outcome := item["status"]
+		if i == 0 {
+			outcome = "failed"
+		}
+		contradicting = append(contradicting, map[string]any{"id": item["id"], "label": item["label"], "status": outcome})
+	}
+	status, _ = do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": contradicting,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("contradicting a final outcome must be 409, got %d", status)
+	}
+}
+
+// The saved route keeps plan, executed versions, check conclusions and
+// irreversible impacts as separate fields, so reopening it explains the
+// real state without reinterpreting the plan.
+func TestSavedRouteStoresExecutedConclusionsAndIrreversibleSeparately(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	report := saved["report"].(map[string]any)
+	steps, _ := report["steps"].([]any)
+	checks, _ := steps[0].(map[string]any)["checks"].([]any)
+	recorded := []map[string]any{}
+	for _, item := range checks {
+		check := item.(map[string]any)
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": "success"})
+	}
+	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": recorded,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, confirmed)
+	}
+	executed, _ := confirmed["executed"].(map[string]any)
+	if executed["app"] != "2.0.0" || executed["lib"] != "2.0.0" {
+		t.Fatalf("executed versions must reflect the effective step, got %v", executed)
+	}
+	conclusions, _ := confirmed["conclusions"].([]any)
+	if len(conclusions) != len(recorded) {
+		t.Fatalf("every recorded check must be stored as a conclusion, got %v", conclusions)
+	}
+	first, _ := conclusions[0].(map[string]any)
+	if first["stepIndex"].(float64) != 1 {
+		t.Fatalf("conclusion must name its step, got %v", first)
+	}
+	irreversible, _ := confirmed["irreversible"].([]any)
+	if len(irreversible) == 0 {
+		t.Fatalf("cross-major data transformation must be stored as irreversible")
+	}
+	// The plan itself stays separate: remaining steps are still planned only.
+	remaining, _ := confirmed["report"].(map[string]any)["steps"].([]any)
+	if len(remaining) == 0 {
+		t.Fatalf("planned remaining steps must stay in the plan, got %v", confirmed["report"])
+	}
+	final, _ := confirmed["report"].(map[string]any)["finalSelection"].(map[string]any)
+	if final["app"] != "3.0.0" {
+		t.Fatalf("plan keeps the final goal, got %v", final)
+	}
+	if executed["app"] == final["app"] {
+		t.Fatalf("executed state must not be the planned final version")
+	}
+}
+
+// Two pages submitting records for the same route: identical retries both
+// succeed without duplicating the step; contradictory records are rejected
+// and never overwrite the stored history.
+func TestConcurrentConfirmsStayIdempotentAndRejectContradiction(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	steps, _ := saved["report"].(map[string]any)["steps"].([]any)
+	checks, _ := steps[0].(map[string]any)["checks"].([]any)
+	build := func(outcome string) []map[string]any {
+		out := []map[string]any{}
+		for _, item := range checks {
+			check := item.(map[string]any)
+			out = append(out, map[string]any{"id": check["id"], "label": check["label"], "status": outcome})
+		}
+		return out
+	}
+	success := build("success")
+	failed := build("failed")
+
+	// Both pages submit concurrently, one success and one failed record.
+	type outcome struct {
+		code    int
+		success bool
+	}
+	results := make(chan outcome, 2)
+	go func() {
+		code, _ := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+			"routeId": routeID, "stepIndex": 1, "checks": success,
+		})
+		results <- outcome{code: code, success: true}
+	}()
+	go func() {
+		code, _ := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+			"routeId": routeID, "stepIndex": 1, "checks": failed,
+		})
+		results <- outcome{code: code}
+	}()
+	first, second := <-results, <-results
+	codes := map[int]bool{first.code: true, second.code: true}
+	if !codes[http.StatusOK] || !codes[http.StatusConflict] {
+		t.Fatalf("one submission must win and the other be rejected, got %d and %d", first.code, second.code)
+	}
+
+	// The winning record is stored exactly once; retrying it is idempotent.
+	winning := failed
+	if (first.code == http.StatusOK && first.success) || (second.code == http.StatusOK && second.success) {
+		winning = success
+	}
+	status, replay := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": winning,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("idempotent retry status %d", status)
+	}
+	confirmedSteps, _ := replay["report"].(map[string]any)["confirmedSteps"].([]any)
+	if len(confirmedSteps) != 1 {
+		t.Fatalf("step must be recorded exactly once, got %v", replay["report"])
+	}
+	storedChecks, _ := confirmedSteps[0].(map[string]any)["checks"].([]any)
+	for _, item := range storedChecks {
+		check := item.(map[string]any)
+		if check["status"] != winning[0]["status"] {
+			t.Fatalf("stored history must not be overwritten, got %v", check)
+		}
+	}
+}

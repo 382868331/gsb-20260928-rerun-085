@@ -46,7 +46,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 			report := failRoute(req, fmt.Sprintf("已确认的第 %d 步与当前状态不一致：历史步骤不能被重算成另一条路线", i+1), nil)
 			report.ConfirmedSteps = confirmed
 			report.HeldSteps = held
-			report.Options = buildOptions(req.Manifest, goals, state, confirmed, req.Current)
+			report.Options = buildOptions(req.Manifest, goals, state, confirmed, held, req.Current)
 			return report
 		}
 		step.Index = i + 1
@@ -59,7 +59,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 			report.ConfirmedSteps = confirmed
 			report.HeldSteps = held
 			report.ResumedFrom = cloneMap(previous)
-			report.Options = buildOptions(req.Manifest, goals, previous, confirmed, req.Current)
+			report.Options = buildOptions(req.Manifest, goals, previous, confirmed, held, req.Current)
 			return report
 		}
 		confirmed = append(confirmed, step)
@@ -78,7 +78,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 		report.ConfirmedSteps = confirmed
 		report.HeldSteps = held
 		report.ResumedFrom = state
-		report.Options = buildOptions(req.Manifest, goals, state, confirmed, req.Current)
+		report.Options = buildOptions(req.Manifest, goals, state, confirmed, held, req.Current)
 		return report
 	}
 	final := solveReport.Selection
@@ -102,7 +102,7 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 				FinalSelection:     cloneMap(final),
 				ConflictMessage:    "剩余改动无法排出可执行的下一步：任意组合都会破坏当前运行组件的约束",
 				RemainingConflicts: remainingConflicts(req.Manifest, state, pending),
-				Options:            buildOptions(req.Manifest, goals, state, confirmed, req.Current),
+				Options:            buildOptions(req.Manifest, goals, state, confirmed, held, req.Current),
 			}
 			return report
 		}
@@ -118,7 +118,10 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 		HeldSteps:      held,
 		Steps:          steps,
 		FinalSelection: cloneMap(final),
-		Options:        buildOptions(req.Manifest, goals, state, confirmed, req.Current),
+		// Options describe the way forward from the state that has really
+		// been executed, never from the planned final selection: showing
+		// final versions here would present a plan as if it already ran.
+		Options: buildOptions(req.Manifest, goals, resumed, confirmed, held, req.Current),
 	}
 }
 
@@ -176,9 +179,15 @@ func printableFrom(from string) string {
 // keep the state and fix the remaining route, roll back to the last
 // still-compatible old state, or stop. Each option lists the impacts it
 // does not resolve, including data transformations versions cannot undo.
-func buildOptions(manifest domain.Manifest, goals []domain.MigrationGoal, current map[string]string, executed []domain.RouteStep, base map[string]string) []domain.RouteOption {
+// Held steps count as executed here: their checks did not pass, but any
+// one-time data transformation they performed already happened and must
+// not be treated as if it never occurred.
+func buildOptions(manifest domain.Manifest, goals []domain.MigrationGoal, current map[string]string, executed []domain.RouteStep, held []domain.RouteStep, base map[string]string) []domain.RouteOption {
 	irreversible := []string{}
 	for _, step := range executed {
+		irreversible = append(irreversible, step.Rollback.Irreversible...)
+	}
+	for _, step := range held {
 		irreversible = append(irreversible, step.Rollback.Irreversible...)
 	}
 	unmet := []string{}

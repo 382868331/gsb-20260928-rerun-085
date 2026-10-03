@@ -16,8 +16,8 @@ export default function App() {
   const [independentReport, setIndependentReport] = useState<Report | null>(null)
   const [comparisons, setComparisons] = useState<{ label: string; locks: Record<string, string>; report: Report }[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
-  const [confirmedSteps, setConfirmedSteps] = useState<RouteStep[]>([])
   const [route, setRoute] = useState<RouteReport | null>(null)
+  const [activeRoute, setActiveRoute] = useState<SavedRoute | null>(null)
   const [savedRoutes, setSavedRoutes] = useState<SavedRoute[]>([])
   const [openRoute, setOpenRoute] = useState<SavedRoute | null>(null)
   const [replanned, setReplanned] = useState<RouteReport | null>(null)
@@ -45,8 +45,8 @@ export default function App() {
     setSavedReport(null)
     setIndependentReport(null)
     setComparisons([])
-    setConfirmedSteps([])
     setRoute(null)
+    setActiveRoute(null)
     setError('')
   }
 
@@ -105,27 +105,60 @@ export default function App() {
     }
   }
 
-  async function runRoute(action: 'plan' | 'save' | 'confirm') {
+  function routeRequestPayload() {
+    const payload = currentPayload()
+    return {
+      manifest: payload.manifest,
+      current: payload.current,
+      target: payload.target,
+      desiredVersion: payload.desiredVersion,
+      goals: payload.goals,
+      locks: payload.locks,
+      confirmed: activeRoute?.report.confirmedSteps ?? [],
+    }
+  }
+
+  async function runRoute(action: 'plan' | 'save') {
     setBusy(true)
     setError('')
     try {
+      const request = routeRequestPayload()
+      if (action === 'save') {
+        const saved = await saveRoute(request)
+        // 相同请求的重复保存返回原记录，一次性转换不会重复执行。
+        setActiveRoute(saved)
+        setRoute(saved.report)
+        await refreshRoutes()
+      } else {
+        setRoute(await planRoute(request))
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // 逐项登记核对结果：提交到已保存路线，服务端只在全部成功时把步骤计入
+  // 已完成；随后从真实已完成状态重新规划剩余路线，已执行历史不被改写。
+  async function confirmActiveStep(stepIndex: number, checks: StepCheck[]) {
+    if (!activeRoute) return
+    setBusy(true)
+    setError('')
+    try {
+      const updated = await confirmRouteStep({ routeId: activeRoute.id, stepIndex, checks })
+      setActiveRoute(updated)
+      await refreshRoutes()
       const payload = currentPayload()
-      const confirmed = action === 'confirm' && route && route.steps.length > 0
-        ? [...confirmedSteps, { ...route.steps[0], confirmed: true }]
-        : confirmedSteps
-      const request = {
+      setRoute(await planRoute({
         manifest: payload.manifest,
         current: payload.current,
         target: payload.target,
         desiredVersion: payload.desiredVersion,
         goals: payload.goals,
         locks: payload.locks,
-        confirmed,
-      }
-      const result = action === 'save' ? (await saveRoute(request)).report : await planRoute(request)
-      setConfirmedSteps(confirmed)
-      setRoute(result)
-      if (action === 'save') await refreshRoutes()
+        confirmed: updated.report.confirmedSteps ?? [],
+      }))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -192,15 +225,15 @@ export default function App() {
         <h2>分阶段升级路线</h2>
         <p className="hint">
           每个中间状态都经过独立核验；单步不允许跨多个大版本，必要时会安排过渡版本。
-          {confirmedSteps.length > 0 ? '已确认的步骤保持原样，可修改目标或锁定后从已完成状态继续规划。' : '确认前几步后，可修改最终目标或锁定未升级组件，再从已完成状态继续。'}
+          保存路线后逐项登记核对结果（成功 / 失败 / 资料不足），后续规划只从真实已完成状态继续；
+          已执行的转换与核对记录不会被新路线覆盖，资料不足的步骤可稍后补录。
         </p>
         <div className="actions">
-          <button onClick={() => void runRoute('plan')} disabled={busy} className="primary">{confirmedSteps.length > 0 ? '从已完成状态继续规划' : '规划分阶段路线'}</button>
-          <button onClick={() => void runRoute('confirm')} disabled={busy || !route || route.status !== 'feasible' || route.steps.length === 0}>确认下一步</button>
-          <button onClick={() => void runRoute('save')} disabled={busy || !route}>保存路线</button>
-          {confirmedSteps.length > 0 ? <button onClick={() => { setConfirmedSteps([]); setRoute(null) }} disabled={busy}>放弃已确认步骤</button> : null}
+          <button onClick={() => void runRoute('plan')} disabled={busy} className="primary">{activeRoute ? '按真实已完成状态重新规划' : '规划分阶段路线'}</button>
+          <button onClick={() => void runRoute('save')} disabled={busy || !route}>保存路线（相同请求返回原记录）</button>
         </div>
-        {route ? <RouteResult route={route} confirmedCount={confirmedSteps.length} /> : null}
+        {activeRoute ? <ActiveRoute route={activeRoute} busy={busy} onConfirm={confirmActiveStep} /> : null}
+        {route ? <RouteResult route={route} /> : null}
       </section>
 
       {comparisons.length > 0 ? <Comparison items={comparisons} /> : null}
@@ -253,7 +286,74 @@ export default function App() {
   )
 }
 
-function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedCount: number }) {
+// ActiveRoute is the saved route currently being executed on this page:
+// its confirmed history stays verbatim, the next planned step exposes one
+// recorder per attached check, and held steps can be supplemented later.
+function ActiveRoute({ route, busy, onConfirm }: {
+  route: SavedRoute
+  busy: boolean
+  onConfirm: (stepIndex: number, checks: StepCheck[]) => Promise<void>
+}) {
+  const confirmed = route.report.confirmedSteps ?? []
+  const remaining = route.report.steps ?? []
+  const next = remaining[0]
+  return (
+    <div className="route-result">
+      <h3>当前执行的已保存路线</h3>
+      {route.executed ? (
+        <p className="hint">
+          已执行版本（真实状态）：{Object.entries(route.executed).sort().map(([name, version]) => name + '@' + version).join(' ') || '—'}
+        </p>
+      ) : null}
+      {route.irreversible?.length ? (
+        <ul className="compact">
+          {route.irreversible.map((item, index) => <li key={index} className="warning-text">{item}</li>)}
+        </ul>
+      ) : null}
+      {confirmed.map((step) => (
+        <div key={step.index} className={'step-card confirmed' + (step.effective ? '' : ' held')}>
+          <h3>
+            第 {step.index} 步（已确认）
+            <span className={step.effective ? 'success-text' : 'warning-text'}>{step.effective ? '已生效' : '未生效（核对未全部成功）'}</span>
+          </h3>
+          <ul className="compact">
+            {step.changes.map((change) => (
+              <li key={change.component}>{change.component}：{change.from || '（未安装）'} → {change.to || '（退出）'}</li>
+            ))}
+          </ul>
+          {step.effective ? (
+            <ul className="compact">
+              {(step.checks ?? []).map((check) => (
+                <li key={check.id} className={checkStatusClass(check.status)}>
+                  {check.label} — {checkStatusLabel(check.status)}
+                  {check.note ? <span className="hint">（{check.note}）</span> : null}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <>
+              <p className="hint">已执行但核对未全部成功：数据转换不会被视为从未发生；资料不足的核对项可补录，已定的成功/失败结论不可改写。</p>
+              <CheckRecorder
+                checks={step.checks ?? []}
+                busy={busy}
+                submitLabel="补录资料不足的核对项"
+                onSubmit={(checks) => onConfirm(step.index, checks)}
+              />
+            </>
+          )}
+        </div>
+      ))}
+      {next ? (
+        <PendingStep key={next.index} step={next} busy={busy} onConfirm={(checks) => onConfirm(next.index, checks)} />
+      ) : (
+        <p className="success-text">没有剩余待执行步骤。</p>
+      )}
+    </div>
+  )
+}
+
+function RouteResult({ route }: { route: RouteReport }) {
+  const confirmedCount = route.confirmedSteps?.length ?? 0
   return (
     <div className="route-result">
       {route.status === 'conflict' ? (
@@ -406,6 +506,17 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
         <button onClick={() => void onReplan()} disabled={busy} className="primary">按真实已完成状态重新规划</button>
         <button onClick={onClose} disabled={busy}>收起</button>
       </div>
+      {route.executed ? (
+        <p className="hint">
+          已执行版本（与计划分开保存的真实状态）：
+          {Object.entries(route.executed).sort().map(([name, version]) => ' ' + name + '@' + version)}
+        </p>
+      ) : null}
+      {route.irreversible?.length ? (
+        <ul className="compact">
+          {route.irreversible.map((item, index) => <li key={index} className="warning-text">{item}</li>)}
+        </ul>
+      ) : null}
       {confirmed.length ? (
         <>
           <h3>已确认步骤（含核对记录）</h3>
@@ -420,14 +531,23 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
                   <li key={change.component}>{change.component}：{change.from || '（未安装）'} → {change.to || '（退出）'}</li>
                 ))}
               </ul>
-              <ul className="compact">
-                {(step.checks ?? []).map((check) => (
-                  <li key={check.id} className={checkStatusClass(check.status)}>
-                    {check.label} — {checkStatusLabel(check.status)}
-                    {check.note ? <span className="hint">（{check.note}）</span> : null}
-                  </li>
-                ))}
-              </ul>
+              {step.effective ? (
+                <ul className="compact">
+                  {(step.checks ?? []).map((check) => (
+                    <li key={check.id} className={checkStatusClass(check.status)}>
+                      {check.label} — {checkStatusLabel(check.status)}
+                      {check.note ? <span className="hint">（{check.note}）</span> : null}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <CheckRecorder
+                  checks={step.checks ?? []}
+                  busy={busy}
+                  submitLabel="补录资料不足的核对项"
+                  onSubmit={(checks) => onConfirm(step.index, checks)}
+                />
+              )}
             </div>
           ))}
         </>
@@ -459,9 +579,7 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
 }
 
 function PendingStep({ step, busy, onConfirm }: { step: RouteStep; busy: boolean; onConfirm: (checks: StepCheck[]) => Promise<void> }) {
-  const [choices, setChoices] = useState<Record<string, string>>({})
   const checks = step.checks ?? []
-  const allChosen = checks.length > 0 && checks.every((check) => choices[check.id])
   return (
     <div className="step-card">
       <h3>第 {step.index} 步</h3>
@@ -479,33 +597,64 @@ function PendingStep({ step, busy, onConfirm }: { step: RouteStep; busy: boolean
           {step.rollback.irreversible.map((item, index) => <li key={index} className="warning-text">{item}</li>)}
         </ul>
       ) : null}
+      <CheckRecorder
+        checks={checks}
+        busy={busy}
+        submitLabel="记录核对结果（一次性，不可被新路线覆盖）"
+        onSubmit={onConfirm}
+      />
+    </div>
+  )
+}
+
+// CheckRecorder lets the user register each attached check as 成功 / 失败 /
+// 资料不足. Already-final outcomes (success, failed) are shown locked: they
+// are append-only history. Pending and insufficient checks stay editable so
+// 资料不足 can be supplemented later without rewriting the rest.
+function CheckRecorder({ checks, busy, submitLabel, onSubmit }: {
+  checks: StepCheck[]
+  busy: boolean
+  submitLabel: string
+  onSubmit: (checks: StepCheck[]) => Promise<void>
+}) {
+  const [choices, setChoices] = useState<Record<string, string>>({})
+  const locked = (check: StepCheck) => check.status === 'success' || check.status === 'failed'
+  const effective = (check: StepCheck) => choices[check.id] ?? (check.status === 'pending' ? undefined : check.status)
+  const allChosen = checks.length > 0 && checks.every((check) => effective(check))
+  const dirty = checks.some((check) => choices[check.id] && choices[check.id] !== check.status)
+  return (
+    <>
       <ul className="compact">
         {checks.map((check) => (
           <li key={check.id}>
             {check.label}
-            <span className="check-actions">
-              {(['success', 'failed', 'insufficient'] as const).map((status) => (
-                <button
-                  key={status}
-                  disabled={busy}
-                  className={choices[check.id] === status ? 'primary' : ''}
-                  onClick={() => setChoices({ ...choices, [check.id]: status })}
-                >
-                  {checkStatusLabel(status)}
-                </button>
-              ))}
-            </span>
+            {locked(check) ? (
+              <span className={checkStatusClass(check.status)}> — {checkStatusLabel(check.status)}（已定，不可改写）</span>
+            ) : (
+              <span className="check-actions">
+                {(['success', 'failed', 'insufficient'] as const).map((status) => (
+                  <button
+                    key={status}
+                    disabled={busy}
+                    className={effective(check) === status ? 'primary' : ''}
+                    onClick={() => setChoices({ ...choices, [check.id]: status })}
+                  >
+                    {checkStatusLabel(status)}
+                  </button>
+                ))}
+              </span>
+            )}
           </li>
         ))}
       </ul>
       <button
-        disabled={busy || !allChosen}
+        disabled={busy || !allChosen || !dirty}
         className="primary"
-        onClick={() => void onConfirm(checks.map((check) => ({ ...check, status: choices[check.id] })))}
+        onClick={() => void onSubmit(checks.map((check) => ({ ...check, status: effective(check) ?? check.status })))}
       >
-        记录核对结果（一次性，不可被新路线覆盖）
+        {submitLabel}
       </button>
-    </div>
+    </>
   )
 }
 

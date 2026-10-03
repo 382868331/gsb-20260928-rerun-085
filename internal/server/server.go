@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"io/fs"
 	"net/http"
-	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"dependency-workbench/internal/domain"
@@ -23,6 +23,9 @@ type Server struct {
 	routes *store.RouteStore
 	static fs.FS
 	mux    *http.ServeMux
+	// confirmMu serializes check-outcome submissions so two pages posting
+	// records for the same route cannot interleave read-modify-write.
+	confirmMu sync.Mutex
 }
 
 func New(planStore *store.Store, routeStore *store.RouteStore, static fs.FS) *Server {
@@ -120,6 +123,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			Report:      report,
 			CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 		}
+		syncRouteLedger(&saved)
 		if err := s.routes.Save(saved); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -134,7 +138,9 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 // saved route. Re-sending the identical record is a no-op; a different
 // record for an already-recorded step is rejected because executed
 // transformations and their verification records cannot be overwritten by
-// a new route.
+// a new route. The one exception is 资料补录: checks still marked
+// insufficient may be filled in later, while final outcomes (success or
+// failed) are append-only and any contradiction is rejected.
 func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 	if s.routes == nil {
 		writeError(w, http.StatusServiceUnavailable, "route store is not configured")
@@ -149,6 +155,11 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Two pages may submit records for the same route at the same time;
+	// serialize the whole read-modify-write so retries stay idempotent and
+	// contradictions are rejected instead of silently overwriting history.
+	s.confirmMu.Lock()
+	defer s.confirmMu.Unlock()
 	routes, err := s.routes.List()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -170,28 +181,37 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if recorded(step.Checks) {
-		if reflect.DeepEqual(normalizeChecks(step.Checks), normalizeChecks(payload.Checks)) {
+		merged, status := mergeRecordedChecks(step.Checks, payload.Checks)
+		switch status {
+		case "replay":
 			// Idempotent retry after an interrupted save: nothing is
 			// executed again, the stored record is returned as-is.
 			writeJSON(w, http.StatusOK, *saved)
 			return
-		}
-		writeError(w, http.StatusConflict, "该步骤的核对记录已存在，不能被新记录覆盖")
-		return
-	}
-	for _, check := range payload.Checks {
-		switch check.Status {
-		case "success", "failed", "insufficient":
-		default:
-			writeError(w, http.StatusBadRequest, "check status must be success, failed or insufficient")
+		case "invalid":
+			writeError(w, http.StatusBadRequest, "check status must be success, failed or insufficient, and every recorded check must be present")
+			return
+		case "conflict":
+			writeError(w, http.StatusConflict, "该步骤的核对记录已存在，不能被新记录覆盖")
 			return
 		}
+		// 资料补录: only checks that were still insufficient changed.
+		step.Checks = merged
+	} else {
+		for _, check := range payload.Checks {
+			switch check.Status {
+			case "success", "failed", "insufficient":
+			default:
+				writeError(w, http.StatusBadRequest, "check status must be success, failed or insufficient")
+				return
+			}
+		}
+		if len(payload.Checks) != len(step.Checks) {
+			writeError(w, http.StatusBadRequest, "must record an outcome for every attached check")
+			return
+		}
+		step.Checks = append([]domain.StepCheck{}, payload.Checks...)
 	}
-	if len(payload.Checks) != len(step.Checks) {
-		writeError(w, http.StatusBadRequest, "must record an outcome for every attached check")
-		return
-	}
-	step.Checks = append([]domain.StepCheck{}, payload.Checks...)
 	allSuccess := true
 	for _, check := range step.Checks {
 		if check.Status != "success" {
@@ -200,22 +220,139 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	step.Confirmed = true
 	step.Effective = allSuccess
-	// Move the step out of the planned list into the executed history,
-	// keeping its check record verbatim for any later route.
-	remaining := []domain.RouteStep{}
-	for _, item := range saved.Report.Steps {
-		if item.Index != payload.StepIndex {
-			remaining = append(remaining, item)
+	if !alreadyConfirmed(saved, payload.StepIndex) {
+		// Move the step out of the planned list into the executed history,
+		// keeping its check record verbatim for any later route.
+		remaining := []domain.RouteStep{}
+		for _, item := range saved.Report.Steps {
+			if item.Index != payload.StepIndex {
+				remaining = append(remaining, item)
+			}
 		}
+		saved.Report.Steps = remaining
+		saved.Report.ConfirmedSteps = append(saved.Report.ConfirmedSteps, *step)
+		saved.Request.Confirmed = append(saved.Request.Confirmed, *step)
 	}
-	saved.Report.Steps = remaining
-	saved.Report.ConfirmedSteps = append(saved.Report.ConfirmedSteps, *step)
-	saved.Request.Confirmed = append(saved.Request.Confirmed, *step)
+	syncRouteLedger(saved)
 	if err := s.routes.Update(*saved); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, *saved)
+}
+
+// alreadyConfirmed reports whether the step has previously been moved into
+// the executed history (e.g. a 资料补录 submission for a held step).
+func alreadyConfirmed(saved *domain.SavedRoute, index int) bool {
+	for _, step := range saved.Report.ConfirmedSteps {
+		if step.Index == index {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeRecordedChecks compares a new submission with the stored record of
+// an already-recorded step. It returns the merged checks and one of:
+//
+//	replay    - identical record, nothing to do
+//	supplement - only insufficient checks were filled in; merged is returned
+//	conflict  - a final outcome (success/failed) would be overwritten
+//	invalid   - malformed submission
+func mergeRecordedChecks(existing []domain.StepCheck, incoming []domain.StepCheck) ([]domain.StepCheck, string) {
+	if len(incoming) != len(existing) {
+		return nil, "invalid"
+	}
+	byID := map[string]domain.StepCheck{}
+	for _, check := range incoming {
+		switch check.Status {
+		case "success", "failed", "insufficient":
+		default:
+			return nil, "invalid"
+		}
+		byID[check.ID] = check
+	}
+	merged := make([]domain.StepCheck, 0, len(existing))
+	changed := false
+	for _, stored := range existing {
+		next, ok := byID[stored.ID]
+		if !ok {
+			return nil, "invalid"
+		}
+		switch stored.Status {
+		case "success", "failed":
+			// Final outcomes are append-only: a contradicting record is
+			// rejected outright, never merged over history.
+			if next.Status != stored.Status {
+				return nil, "conflict"
+			}
+			merged = append(merged, stored)
+		default:
+			// 资料不足 (or still pending) checks may be supplemented later.
+			if next.Status != stored.Status {
+				changed = true
+			}
+			updated := stored
+			updated.Status = next.Status
+			if next.Note != "" {
+				updated.Note = next.Note
+			}
+			merged = append(merged, updated)
+		}
+	}
+	if !changed {
+		return nil, "replay"
+	}
+	return merged, "supplement"
+}
+
+// syncRouteLedger keeps the separately stored ledger of a saved route in
+// step with its report: the versions actually executed, every recorded
+// check conclusion, and the one-time impacts no rollback can undo.
+func syncRouteLedger(saved *domain.SavedRoute) {
+	executed := map[string]string{}
+	for name, version := range saved.Request.Current {
+		executed[name] = version
+	}
+	conclusions := []domain.CheckRecord{}
+	irreversible := []string{}
+	steps := append([]domain.RouteStep{}, saved.Report.ConfirmedSteps...)
+	// Held steps were executed too: their conclusions and one-time impacts
+	// belong in the ledger even though planning does not count them as done.
+	steps = append(steps, saved.Report.HeldSteps...)
+	sortSteps(steps)
+	for _, step := range steps {
+		for _, check := range step.Checks {
+			if check.Status == "" || check.Status == "pending" {
+				continue
+			}
+			conclusions = append(conclusions, domain.CheckRecord{StepIndex: step.Index, Check: check})
+		}
+		// Held steps count too: a failed check does not undo a data
+		// transformation that was already executed.
+		irreversible = append(irreversible, step.Rollback.Irreversible...)
+		if !step.Effective {
+			continue
+		}
+		for _, change := range step.Changes {
+			if change.To == "" {
+				delete(executed, change.Component)
+			} else {
+				executed[change.Component] = change.To
+			}
+		}
+	}
+	saved.Executed = executed
+	saved.Conclusions = conclusions
+	saved.Irreversible = irreversible
+}
+
+func sortSteps(steps []domain.RouteStep) {
+	for i := 1; i < len(steps); i++ {
+		for j := i; j > 0 && steps[j-1].Index > steps[j].Index; j-- {
+			steps[j-1], steps[j] = steps[j], steps[j-1]
+		}
+	}
 }
 
 func findStep(saved *domain.SavedRoute, index int) *domain.RouteStep {
@@ -239,14 +376,6 @@ func recorded(checks []domain.StepCheck) bool {
 		}
 	}
 	return false
-}
-
-func normalizeChecks(checks []domain.StepCheck) []domain.StepCheck {
-	out := make([]domain.StepCheck, 0, len(checks))
-	for _, check := range checks {
-		out = append(out, domain.StepCheck{ID: check.ID, Status: check.Status, Note: check.Note})
-	}
-	return out
 }
 
 func fingerprintOf(req domain.RouteRequest) string {
