@@ -248,12 +248,18 @@ func TestUnrecordedOrFailedChecksHoldTheStep(t *testing.T) {
 		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
 	}
 	cases := []struct {
-		name   string
-		checks []domain.StepCheck
+		name        string
+		checks      []domain.StepCheck
+		executed    bool
+		resumedApp  string
+		remainSteps int
 	}{
-		{"pending", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "pending"}}},
-		{"failed", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "failed"}}},
-		{"insufficient", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "insufficient"}}},
+		{"pending", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "pending"}}, false, "1.0.0", 2},
+		{"failed", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "failed"}}, false, "1.0.0", 2},
+		// 资料不足: the conversion physically ran, so the real state keeps
+		// it and planning continues from 2.0.0 instead of scheduling the
+		// same conversion again; the step stays held for 补录.
+		{"insufficient", []domain.StepCheck{{ID: "c1", Label: "核对", Status: "insufficient"}}, true, "2.0.0", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,13 +278,120 @@ func TestUnrecordedOrFailedChecksHoldTheStep(t *testing.T) {
 			if len(report.HeldSteps) != 1 || report.HeldSteps[0].Effective {
 				t.Fatalf("step must be held with its record preserved, got %+v", report.HeldSteps)
 			}
-			if report.ResumedFrom["app"] != "1.0.0" {
-				t.Fatalf("planning must resume from the truly completed state, got %v", report.ResumedFrom)
+			if report.HeldSteps[0].Executed != tc.executed {
+				t.Fatalf("executed fact = %v, want %v", report.HeldSteps[0].Executed, tc.executed)
 			}
-			if len(report.Steps) != 2 {
+			if report.ResumedFrom["app"] != tc.resumedApp {
+				t.Fatalf("planning must resume from the real state, got %v", report.ResumedFrom)
+			}
+			if len(report.Steps) != tc.remainSteps {
 				t.Fatalf("remaining route must be replanned from the real state, got %+v", report.Steps)
 			}
 		})
+	}
+}
+
+// The reported bug: the joint app/lib 1.0.0 -> 2.0.0 conversion ran, three
+// checks are success and the last is 资料不足. The real version must be
+// 2.0.0, planning must not schedule the same conversion again, and the
+// options must explain 补录/停止/回退 separately.
+func TestInsufficientCheckDoesNotEraseExecutedConversion(t *testing.T) {
+	manifest := mutualManifest()
+	initial := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "2.0.0",
+	})
+	if initial.Status != "feasible" || len(initial.Steps) != 1 {
+		t.Fatalf("initial plan failed: %s", initial.ConflictMessage)
+	}
+	step := initial.Steps[0]
+	if len(step.Checks) < 2 {
+		t.Fatalf("joint conversion must carry several checks, got %+v", step.Checks)
+	}
+	for i := range step.Checks {
+		step.Checks[i].Status = "success"
+	}
+	step.Checks[len(step.Checks)-1].Status = "insufficient"
+	report := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "2.0.0",
+		Confirmed:      []domain.RouteStep{step},
+	})
+	if report.ResumedFrom["app"] != "2.0.0" || report.ResumedFrom["lib"] != "2.0.0" {
+		t.Fatalf("real state must keep the executed conversion, got %v", report.ResumedFrom)
+	}
+	for _, remaining := range report.Steps {
+		for _, change := range remaining.Changes {
+			if change.From == "1.0.0" && change.To == "2.0.0" {
+				t.Fatalf("executed conversion must not be scheduled again, got %+v", remaining)
+			}
+		}
+	}
+	if len(report.HeldSteps) != 1 || !report.HeldSteps[0].Executed || report.HeldSteps[0].Effective {
+		t.Fatalf("step must stay held as executed-but-unverified, got %+v", report.HeldSteps)
+	}
+	state, impacts := ExecutedSummary(domain.RouteRequest{
+		Current: map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+	}, report)
+	if state["app"] != "2.0.0" || state["lib"] != "2.0.0" {
+		t.Fatalf("executed state must be 2.0.0, got %v", state)
+	}
+	if len(impacts) == 0 {
+		t.Fatal("data migration impacts of the executed conversion must survive")
+	}
+	byKind := map[string]domain.RouteOption{}
+	for _, option := range report.Options {
+		byKind[option.Kind] = option
+	}
+	supplement, ok := byKind["supplement"]
+	if !ok {
+		t.Fatalf("补录 option must be offered, got %+v", report.Options)
+	}
+	if supplement.State["app"] != "2.0.0" {
+		t.Fatalf("补录 must keep the real state, got %v", supplement.State)
+	}
+	joined := ""
+	for _, impact := range supplement.Impacts {
+		joined += impact
+	}
+	if !strings.Contains(joined, "不会重复执行") {
+		t.Fatalf("补录 must explain it never re-executes the conversion, got %v", supplement.Impacts)
+	}
+	if _, ok := byKind["stop"]; !ok {
+		t.Fatal("stop option must be offered")
+	}
+	rollback, ok := byKind["rollback"]
+	if !ok || rollback.State["app"] != "1.0.0" {
+		t.Fatalf("rollback must return to the still-compatible old state, got %+v", rollback)
+	}
+	rollbackJoined := ""
+	for _, impact := range rollback.Impacts {
+		rollbackJoined += impact
+	}
+	if !strings.Contains(rollbackJoined, "数据") {
+		t.Fatalf("rollback must explain data transforms are not undone, got %v", rollback.Impacts)
+	}
+	// 中途改变最终目标: replanning towards a new goal continues from the
+	// real 2.0.0 state, keeping the held record untouched.
+	replanned := Plan(domain.RouteRequest{
+		Manifest:       manifest,
+		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
+		Target:         "app",
+		DesiredVersion: "3.0.0",
+		Confirmed:      []domain.RouteStep{step},
+	})
+	if replanned.ResumedFrom["app"] != "2.0.0" {
+		t.Fatalf("changed goal must resume from the real state, got %v", replanned.ResumedFrom)
+	}
+	if len(replanned.HeldSteps) != 1 {
+		t.Fatalf("held record must survive the new goal, got %+v", replanned.HeldSteps)
+	}
+	if len(replanned.Steps) != 1 || replanned.Steps[0].State["app"] != "3.0.0" {
+		t.Fatalf("only the remaining conversion may be planned, got %+v", replanned.Steps)
 	}
 }
 

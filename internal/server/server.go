@@ -177,6 +177,19 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, *saved)
 			return
 		}
+		if merged, ok := mergeSupplement(step.Checks, payload.Checks); ok {
+			// 补录资料: only previously 资料不足 checks gain an outcome.
+			// The execution fact and the real state are untouched — the
+			// conversion is never re-run, only the check record changes.
+			step.Checks = merged
+			s.refreshStep(saved, step)
+			if err := s.routes.Update(*saved); err != nil {
+				writeJSON(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, *saved)
+			return
+		}
 		writeError(w, http.StatusConflict, "该步骤的核对记录已存在，不能被新记录覆盖")
 		return
 	}
@@ -204,12 +217,20 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	step.Checks = append([]domain.StepCheck{}, payload.Checks...)
 	allSuccess := true
+	anyFailed := false
 	for _, check := range step.Checks {
 		if check.Status != "success" {
 			allSuccess = false
 		}
+		if check.Status == "failed" {
+			anyFailed = true
+		}
 	}
 	step.Confirmed = true
+	// Executed records the physical fact that the conversion ran. A failed
+	// check disputes that fact; 资料不足 does not — missing evidence never
+	// undoes a data migration that already happened.
+	step.Executed = !anyFailed
 	step.Effective = allSuccess
 	// Move the step out of the planned list into the executed history,
 	// keeping its check record verbatim for any later route.
@@ -233,6 +254,94 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, *saved)
+}
+
+// mergeSupplement folds 补录资料 into an existing check record: every
+// previously recorded outcome must be repeated identically, and only
+// checks still marked insufficient may gain a new outcome (success or
+// failed). Anything else would rewrite executed history and is rejected.
+func mergeSupplement(existing, payload []domain.StepCheck) ([]domain.StepCheck, bool) {
+	if len(existing) != len(payload) {
+		return nil, false
+	}
+	byID := map[string]domain.StepCheck{}
+	for _, check := range payload {
+		switch check.Status {
+		case "success", "failed", "insufficient":
+		default:
+			return nil, false
+		}
+		byID[check.ID] = check
+	}
+	merged := make([]domain.StepCheck, 0, len(existing))
+	supplemented := false
+	for _, old := range existing {
+		incoming, found := byID[old.ID]
+		if !found {
+			return nil, false
+		}
+		switch {
+		case old.Status == incoming.Status:
+			merged = append(merged, domain.StepCheck{ID: old.ID, Label: old.Label, Status: old.Status, Note: firstNote(old.Note, incoming.Note)})
+		case old.Status == "insufficient" && (incoming.Status == "success" || incoming.Status == "failed"):
+			merged = append(merged, domain.StepCheck{ID: old.ID, Label: old.Label, Status: incoming.Status, Note: incoming.Note})
+			supplemented = true
+		default:
+			return nil, false
+		}
+	}
+	if !supplemented {
+		return nil, false
+	}
+	return merged, true
+}
+
+func firstNote(existing, incoming string) string {
+	if incoming != "" {
+		return incoming
+	}
+	return existing
+}
+
+// refreshStep propagates a supplemented check record everywhere the step
+// is stored (confirmed/held history and the frozen request), recomputes
+// whether the step is now fully verified, and re-derives the executed
+// state. The conversion itself is never re-executed.
+func (s *Server) refreshStep(saved *domain.SavedRoute, step *domain.RouteStep) {
+	allSuccess := true
+	for _, check := range step.Checks {
+		if check.Status != "success" {
+			allSuccess = false
+		}
+	}
+	step.Effective = allSuccess
+	for i := range saved.Report.ConfirmedSteps {
+		if saved.Report.ConfirmedSteps[i].Index == step.Index {
+			saved.Report.ConfirmedSteps[i] = *step
+		}
+	}
+	held := saved.Report.HeldSteps[:0]
+	foundHeld := false
+	for _, item := range saved.Report.HeldSteps {
+		if item.Index == step.Index {
+			foundHeld = true
+			if !allSuccess {
+				held = append(held, *step)
+			}
+			continue
+		}
+		held = append(held, item)
+	}
+	if !foundHeld && !allSuccess {
+		held = append(held, *step)
+	}
+	saved.Report.HeldSteps = held
+	for i := range saved.Request.Confirmed {
+		if saved.Request.Confirmed[i].Index == step.Index {
+			saved.Request.Confirmed[i] = *step
+		}
+	}
+	saved.ExecutedState, saved.Irreversible = route.ExecutedSummary(saved.Request, saved.Report)
 }
 
 func findStep(saved *domain.SavedRoute, index int) *domain.RouteStep {

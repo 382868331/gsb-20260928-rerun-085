@@ -538,9 +538,13 @@ func TestSavedRouteSeparatesPlanExecutedStateAndImpacts(t *testing.T) {
 	}
 }
 
-func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
+// The reported bug: the joint app/lib 1.0.0 -> 2.0.0 conversion ran, the
+// first checks are success and the last is 资料不足. The real version must
+// move to 2.0.0 and stay there; 资料不足 only keeps the step unverified,
+// it never erases the executed data migration.
+func TestRouteConfirmInsufficientKeepsExecutedState(t *testing.T) {
 	handler := setup(t)
-	sample := scenario(t, handler, "transition")
+	sample := scenario(t, handler, "mutual")
 	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
 	if status != http.StatusCreated {
 		t.Fatalf("save status %d", status)
@@ -550,10 +554,17 @@ func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 	steps, _ := report["steps"].([]any)
 	first := steps[0].(map[string]any)
 	checks, _ := first["checks"].([]any)
+	if len(checks) < 2 {
+		t.Fatalf("joint conversion must carry several checks, got %v", checks)
+	}
 	recorded := []map[string]any{}
-	for _, item := range checks {
+	for i, item := range checks {
 		check := item.(map[string]any)
-		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": "insufficient"})
+		status := "success"
+		if i == len(checks)-1 {
+			status = "insufficient"
+		}
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": status})
 	}
 	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
 		"routeId": routeID, "stepIndex": 1, "checks": recorded,
@@ -561,13 +572,19 @@ func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("confirm status %d: %v", status, confirmed)
 	}
+	// The executed conversion moved the real state to 2.0.0 even though
+	// the last check is 资料不足.
+	executed, _ := confirmed["executedState"].(map[string]any)
+	if executed["app"] != "2.0.0" || executed["lib"] != "2.0.0" {
+		t.Fatalf("insufficient data must not erase the executed conversion, got %v", executed)
+	}
 	confirmedReport := confirmed["report"].(map[string]any)
 	confirmedSteps, _ := confirmedReport["confirmedSteps"].([]any)
 	if len(confirmedSteps) != 1 {
 		t.Fatalf("record must be preserved even when insufficient, got %v", confirmedReport)
 	}
-	// Replanning must not treat the step as done: it stays held and the
-	// route resumes from the state before it.
+	// Replanning continues from the real 2.0.0 state: the step stays held
+	// for 补录 but its conversion is never scheduled again.
 	replanPayload := routeRequestFrom(sample)
 	replanPayload["confirmed"] = confirmedReport["confirmedSteps"]
 	_, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
@@ -576,7 +593,164 @@ func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 		t.Fatalf("insufficient checks must keep the step held, got %v", replanned)
 	}
 	resumed, _ := replanned["resumedFrom"].(map[string]any)
-	if resumed["app"] != "1.0.0" {
-		t.Fatalf("planning must resume from the truly completed state, got %v", resumed)
+	if resumed["app"] != "2.0.0" {
+		t.Fatalf("planning must resume from the real executed state, got %v", resumed)
+	}
+	if remaining, _ := replanned["steps"].([]any); len(remaining) != 0 {
+		t.Fatalf("the executed conversion must not be planned again, got %v", remaining)
+	}
+	// The options must offer 补录资料 next to stop and rollback.
+	options, _ := replanned["options"].([]any)
+	kinds := map[string]bool{}
+	for _, item := range options {
+		option := item.(map[string]any)
+		kinds[option["kind"].(string)] = true
+	}
+	for _, want := range []string{"supplement", "stop", "rollback"} {
+		if !kinds[want] {
+			t.Fatalf("option %s must be offered, got %v", want, options)
+		}
+	}
+}
+
+// 补录资料 updates only the check record: the conversion is not re-run,
+// duplicate submissions stay idempotent, and conflicting rewrites of
+// recorded outcomes are rejected. Covers save/reopen and changing the
+// final goal midway.
+func TestRouteConfirmSupplementUpdatesChecksOnly(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "mutual")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	report := saved["report"].(map[string]any)
+	steps, _ := report["steps"].([]any)
+	checks, _ := steps[0].(map[string]any)["checks"].([]any)
+	recorded := []map[string]any{}
+	for i, item := range checks {
+		check := item.(map[string]any)
+		status := "success"
+		if i == len(checks)-1 {
+			status = "insufficient"
+		}
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": status})
+	}
+	confirm := map[string]any{"routeId": routeID, "stepIndex": 1, "checks": recorded}
+	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/confirm", confirm)
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, confirmed)
+	}
+	// Duplicate submission of the identical record is a no-op.
+	status, again := do(t, handler, http.MethodPost, "/api/routes/confirm", confirm)
+	if status != http.StatusOK {
+		t.Fatalf("duplicate submit status %d: %v", status, again)
+	}
+	if again["id"] != confirmed["id"] {
+		t.Fatalf("duplicate submit must return the same record, got %v", again["id"])
+	}
+	// Rewriting an already-recorded success is rejected.
+	tampered := []map[string]any{}
+	for i, item := range recorded {
+		status := item["status"]
+		if i == 0 {
+			status = "failed"
+		}
+		tampered = append(tampered, map[string]any{"id": item["id"], "label": item["label"], "status": status})
+	}
+	status, conflict := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": tampered,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("rewriting recorded checks must fail, got %d: %v", status, conflict)
+	}
+	// 补录资料: the insufficient check gains an outcome; everything else
+	// stays identical.
+	supplemented := []map[string]any{}
+	for i, item := range recorded {
+		status := item["status"]
+		if i == len(recorded)-1 {
+			status = "success"
+		}
+		supplemented = append(supplemented, map[string]any{"id": item["id"], "label": item["label"], "status": status, "note": "补齐冒烟报告"})
+	}
+	status, filled := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": supplemented,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("supplement status %d: %v", status, filled)
+	}
+	// Only the checks changed: the real state is still 2.0.0 and no
+	// conversion was scheduled or executed again.
+	executed, _ := filled["executedState"].(map[string]any)
+	if executed["app"] != "2.0.0" || executed["lib"] != "2.0.0" {
+		t.Fatalf("supplement must not move the executed state, got %v", executed)
+	}
+	filledReport := filled["report"].(map[string]any)
+	if held, _ := filledReport["heldSteps"].([]any); len(held) != 0 {
+		t.Fatalf("fully supplemented step must leave the held list, got %v", held)
+	}
+	filledSteps, _ := filledReport["confirmedSteps"].([]any)
+	if len(filledSteps) != 1 {
+		t.Fatalf("supplement must not duplicate the step, got %v", filledReport)
+	}
+	firstStep := filledSteps[0].(map[string]any)
+	if effective, _ := firstStep["effective"].(bool); !effective {
+		t.Fatalf("supplemented step must become effective, got %v", firstStep)
+	}
+	// Replaying the supplemented record is idempotent too.
+	status, replay := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": supplemented,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("replaying the supplemented record must be idempotent, got %d: %v", status, replay)
+	}
+	// Save/reopen: the store keeps the supplemented record and the real
+	// state across restarts.
+	req := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var routes []domain.SavedRoute
+	if err := json.Unmarshal(rec.Body.Bytes(), &routes); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(routes))
+	}
+	reopened := routes[0]
+	if reopened.ExecutedState["app"] != "2.0.0" || len(reopened.Irreversible) == 0 {
+		t.Fatalf("reopened route must keep executed state and impacts, got %+v", reopened)
+	}
+	if len(reopened.Report.HeldSteps) != 0 || len(reopened.Report.ConfirmedSteps) != 1 {
+		t.Fatalf("reopened route must keep the supplemented record, got %+v", reopened.Report)
+	}
+	if !reopened.Request.Confirmed[0].Effective {
+		t.Fatalf("reopened request history must keep the effective step, got %+v", reopened.Request.Confirmed)
+	}
+	// 中途改变最终目标: planning towards a new goal resumes from the real
+	// 2.0.0 state and never revisits the executed conversion.
+	replanPayload := routeRequestFrom(sample)
+	replanPayload["desiredVersion"] = "3.0.0"
+	replanPayload["confirmed"] = filledReport["confirmedSteps"]
+	status, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
+	if status != http.StatusOK {
+		t.Fatalf("replan status %d: %v", status, replanned)
+	}
+	resumed, _ := replanned["resumedFrom"].(map[string]any)
+	if resumed["app"] != "2.0.0" {
+		t.Fatalf("changed goal must resume from the real state, got %v", resumed)
+	}
+	if replanned["status"] != "conflict" {
+		t.Fatalf("mutual manifest has no 3.0.0 candidate, got %v", replanned["status"])
+	}
+	steps2, _ := replanned["steps"].([]any)
+	for _, item := range steps2 {
+		for _, raw := range item.(map[string]any)["changes"].([]any) {
+			change := raw.(map[string]any)
+			if change["from"] == "1.0.0" {
+				t.Fatalf("executed conversion must not be replanned, got %v", change)
+			}
+		}
 	}
 }

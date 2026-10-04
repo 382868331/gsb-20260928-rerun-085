@@ -130,9 +130,9 @@ export default function App() {
   }
 
   // Record the per-check outcomes for the next planned step, then replan
-  // from the truly completed state. A step only counts as executed when
-  // every check is recorded as success; failed or insufficient records are
-  // kept verbatim but the step stays held.
+  // from the real state. Recording outcomes marks the conversion executed;
+  // only all-success makes it verified. 资料不足 keeps the executed
+  // conversion in the real state and leaves the step held for 补录.
   async function confirmNextStep(step: RouteStep, checks: StepCheck[]) {
     setBusy(true)
     setError('')
@@ -228,7 +228,7 @@ export default function App() {
         {route && route.status === 'feasible' && route.steps.length > 0 ? (
           <div className="next-confirm">
             <h3>登记第 {route.steps[0].index} 步的逐项核对结果</h3>
-            <p className="hint">执行该步后逐项登记核对结论（成功 / 失败 / 资料不足），失败或资料不足可补录说明；只有全部记为成功才算真正完成，记录一旦提交不会被新路线覆盖。</p>
+            <p className="hint">执行该步后逐项登记核对结论（成功 / 失败 / 资料不足）；资料不足不会抹掉已发生的转换，可稍后补录（仅更新核对）；只有全部记为成功才算核验通过，记录一旦提交不会被新路线覆盖。</p>
             <CheckEditor
               key={`next-${route.steps[0].index}-${confirmedSteps.length}`}
               checks={route.steps[0].checks ?? []}
@@ -314,7 +314,7 @@ function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedC
       {route.heldSteps?.length ? (
         <>
           <h3>已记录但未生效的步骤（核对未全部成功）</h3>
-          <p className="hint">这些步骤的核对记录保持原样，但后续规划不会把它们当作已完成；资料不足的步骤保持待确认。</p>
+          <p className="hint">这些步骤的核对记录保持原样，不计入核验通过；已执行的转换仍计入真实状态，资料不足的步骤可补录。</p>
           {route.heldSteps.map((step) => <StepCard key={'h' + step.index} step={step} />)}
         </>
       ) : null}
@@ -343,7 +343,7 @@ function StepCard({ step }: { step: RouteStep }) {
     <div className={'step-card' + (step.confirmed ? ' confirmed' : '')}>
       <h3>
         第 {step.index} 步{step.confirmed ? '（已确认）' : ''}
-        {step.confirmed && !step.effective ? <em className="warning-text">（核对未全部成功，未生效）</em> : null}
+        {step.confirmed && !step.effective ? <em className="warning-text">{step.executed ? '（已执行，核对未全部成功，待补录）' : '（核对未全部成功，未生效）'}</em> : null}
         <span className={step.verification.status === 'feasible' ? 'success-text' : 'error-text'}> 独立核验：{step.verification.status}</span>
       </h3>
       <ul className="compact">
@@ -399,6 +399,7 @@ function checkStatusClass(status: string) {
 function Options({ options }: { options: RouteOption[] }) {
   const kindLabel: Record<string, string> = {
     continue: '保留当前状态，修正后续路线',
+    supplement: '补录资料（仅更新核对，不重复转换）',
     rollback: '回到仍兼容的旧状态',
     stop: '停止处理',
   }
@@ -432,19 +433,20 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
 }) {
   const confirmed = route.report.confirmedSteps ?? []
   const remaining = route.report.steps ?? []
+  const held = route.report.heldSteps ?? []
   return (
     <section className="card saved">
       <h2>路线详情：{route.request.target} @ {route.request.desiredVersion}</h2>
       <p className="hint">
-        已执行的转换与核对记录保持原样，不会被新路线覆盖；只有核对全部记为成功的步骤才算真正完成，
-        资料不足的步骤保持待确认。保存中断后重开，每个中间状态、核对依据与剩余冲突都能独立解释。
+        已执行的转换与核对记录保持原样，不会被新路线覆盖；资料不足不会抹掉已发生的数据迁移——真实版本以已执行的转换为准，
+        只有核对全部记为成功的步骤才算核验通过，资料不足的步骤可补录（仅更新核对，不重复转换）。保存中断后重开，每个中间状态、核对依据与剩余冲突都能独立解释。
       </p>
       <div className="actions">
         <button onClick={() => void onReplan()} disabled={busy} className="primary">按真实已完成状态重新规划</button>
         <button onClick={onClose} disabled={busy}>收起</button>
       </div>
       <div className="executed-panel">
-        <h3>当前实际状态（仅已生效步骤）</h3>
+        <h3>当前实际状态（已执行的转换，含待补录步骤）</h3>
         <div className="selection">
           {Object.entries(route.executedState ?? route.request.current ?? {}).sort().map(([name, version]) => <span key={name}>{name + '@' + version}</span>)}
         </div>
@@ -464,7 +466,7 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
             <div key={step.index} className={'step-card confirmed' + (step.effective ? '' : ' held')}>
               <h3>
                 第 {step.index} 步
-                <span className={step.effective ? 'success-text' : 'warning-text'}>{step.effective ? '已生效' : '未生效（核对未全部成功）'}</span>
+                <span className={step.effective ? 'success-text' : 'warning-text'}>{step.effective ? '已生效' : step.executed ? '已执行，待补录（核对未全部成功）' : '未生效（核对未全部成功）'}</span>
               </h3>
               <ul className="compact">
                 {step.changes.map((change) => (
@@ -480,6 +482,15 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
                 ))}
               </ul>
             </div>
+          ))}
+        </>
+      ) : null}
+      {held.length ? (
+        <>
+          <h3>待补录步骤（转换已执行，核对资料不足）</h3>
+          <p className="hint">这些步骤的转换已经真实发生并计入当前实际状态；补录只更新核对结论，不会重复执行转换。</p>
+          {held.map((step) => (
+            <SupplementStep key={'held-' + step.index} step={step} busy={busy} onConfirm={(checks) => onConfirm(step.index, checks)} />
           ))}
         </>
       ) : null}
@@ -506,6 +517,66 @@ function SavedRouteDetail({ route, replanned, busy, onConfirm, onReplan, onClose
         </div>
       ) : null}
     </section>
+  )
+}
+
+// SupplementStep lets the user 补录资料 on a held step: only checks still
+// marked 资料不足 can gain an outcome; every other record is shown as-is
+// and submitted unchanged, so the executed conversion is never re-run.
+function SupplementStep({ step, busy, onConfirm }: { step: RouteStep; busy: boolean; onConfirm: (checks: StepCheck[]) => Promise<void> }) {
+  const checks = step.checks ?? []
+  const insufficient = checks.filter((check) => check.status === 'insufficient')
+  const [choices, setChoices] = useState<Record<string, string>>({})
+  const [notes, setNotes] = useState<Record<string, string>>({})
+  const allChosen = insufficient.length > 0 && insufficient.every((check) => choices[check.id])
+  return (
+    <div className="step-card confirmed held">
+      <h3>第 {step.index} 步（已执行，待补录）</h3>
+      <ul className="compact">
+        {step.changes.map((change) => (
+          <li key={change.component}>{change.component}：{change.from || '（未安装）'} → {change.to || '（退出）'}</li>
+        ))}
+      </ul>
+      <ul className="compact">
+        {checks.map((check) => (
+          <li key={check.id} className={checkStatusClass(check.status)}>
+            {check.label} — {checkStatusLabel(check.status)}
+            {check.note ? <span className="hint">（{check.note}）</span> : null}
+            {check.status === 'insufficient' ? (
+              <span className="check-actions">
+                {(['success', 'failed'] as const).map((status) => (
+                  <button
+                    key={status}
+                    disabled={busy}
+                    className={choices[check.id] === status ? 'primary' : ''}
+                    onClick={() => setChoices({ ...choices, [check.id]: status })}
+                  >
+                    {checkStatusLabel(status)}
+                  </button>
+                ))}
+                <input
+                  className="check-note"
+                  placeholder="补录资料 / 说明（可选）"
+                  value={notes[check.id] ?? ''}
+                  onChange={(event) => setNotes({ ...notes, [check.id]: event.target.value })}
+                />
+              </span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+      <button
+        disabled={busy || !allChosen}
+        className="primary"
+        onClick={() => void onConfirm(checks.map((check) => (
+          check.status === 'insufficient' && choices[check.id]
+            ? { ...check, status: choices[check.id], note: notes[check.id]?.trim() || undefined }
+            : check
+        )))}
+      >
+        补录资料（仅更新核对，不重复转换）
+      </button>
+    </div>
   )
 }
 

@@ -53,6 +53,10 @@ export type RouteStep = {
   verification: Report
   rollback: RollbackInfo
   confirmed?: boolean
+  // executed: the conversion physically ran (recorded without a failed
+  // outcome); independent of whether every check passed. 资料不足 keeps
+  // the step executed but not effective.
+  executed?: boolean
   effective?: boolean
 }
 export type RouteOption = { kind: 'continue' | 'rollback' | 'stop' | string; summary: string; state: Record<string, string>; impacts: string[] }
@@ -81,9 +85,9 @@ export type SavedRoute = {
   fingerprint?: string
   request: RouteRequest
   report: RouteReport
-  // executedState: the running set actually reached (effective steps only),
-  // stored separately from the plan; irreversible: data impacts already
-  // incurred, including steps whose checks failed.
+  // executedState: the running set actually reached (every executed step,
+  // held ones included), stored separately from the plan; irreversible:
+  // data impacts already incurred, including steps whose checks failed.
   executedState?: Record<string, string>
   irreversible?: string[]
   createdAt: string
