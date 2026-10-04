@@ -130,9 +130,10 @@ export default function App() {
   }
 
   // Record the per-check outcomes for the next planned step, then replan
-  // from the truly completed state. A step only counts as executed when
-  // every check is recorded as success; failed or insufficient records are
-  // kept verbatim but the step stays held.
+  // from the real executed state. Recording the outcomes marks the step as
+  // executed — its conversion counts even when some checks are failed or
+  // 资料不足; those records stay held for backfill instead of erasing the
+  // migration that already ran.
   async function confirmNextStep(step: RouteStep, checks: StepCheck[]) {
     setBusy(true)
     setError('')
@@ -313,8 +314,8 @@ function RouteResult({ route, confirmedCount }: { route: RouteReport; confirmedC
       ) : null}
       {route.heldSteps?.length ? (
         <>
-          <h3>已记录但未生效的步骤（核对未全部成功）</h3>
-          <p className="hint">这些步骤的核对记录保持原样，但后续规划不会把它们当作已完成；资料不足的步骤保持待确认。</p>
+          <h3>已执行但核对未完成的步骤</h3>
+          <p className="hint">这些步骤的转换已经执行，真实版本状态已计入；核对未全部成功只影响核验结论，可补录资料完成核对，不会重复执行转换。</p>
           {route.heldSteps.map((step) => <StepCard key={'h' + step.index} step={step} />)}
         </>
       ) : null}
@@ -399,6 +400,7 @@ function checkStatusClass(status: string) {
 function Options({ options }: { options: RouteOption[] }) {
   const kindLabel: Record<string, string> = {
     continue: '保留当前状态，修正后续路线',
+    backfill: '补齐核对资料（不重复执行转换）',
     rollback: '回到仍兼容的旧状态',
     stop: '停止处理',
   }

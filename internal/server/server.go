@@ -170,16 +170,6 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown step")
 		return
 	}
-	if recorded(step.Checks) {
-		if reflect.DeepEqual(normalizeChecks(step.Checks), normalizeChecks(payload.Checks)) {
-			// Idempotent retry after an interrupted save: nothing is
-			// executed again, the stored record is returned as-is.
-			writeJSON(w, http.StatusOK, *saved)
-			return
-		}
-		writeError(w, http.StatusConflict, "该步骤的核对记录已存在，不能被新记录覆盖")
-		return
-	}
 	for _, check := range payload.Checks {
 		switch check.Status {
 		case "success", "failed", "insufficient":
@@ -187,6 +177,31 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "check status must be success, failed or insufficient")
 			return
 		}
+	}
+	if recorded(step.Checks) {
+		if reflect.DeepEqual(normalizeChecks(step.Checks), normalizeChecks(payload.Checks)) {
+			// Idempotent retry after an interrupted save: nothing is
+			// executed again, the stored record is returned as-is.
+			writeJSON(w, http.StatusOK, *saved)
+			return
+		}
+		if !backfillOnly(step.Checks, payload.Checks) {
+			writeError(w, http.StatusConflict, "该步骤的核对记录已存在，不能被新记录覆盖")
+			return
+		}
+		// Backfill: 资料不足 checks gain determined outcomes. Only the
+		// verification record changes — the executed conversion is not
+		// re-run and the executed state stays exactly as it was.
+		step.Checks = append([]domain.StepCheck{}, payload.Checks...)
+		step.Effective = checksAllSuccess(step.Checks)
+		syncExecutedStep(saved, step)
+		saved.ExecutedState, saved.Irreversible = route.ExecutedSummary(saved.Request, saved.Report)
+		if err := s.routes.Update(*saved); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, *saved)
+		return
 	}
 	if len(payload.Checks) != len(step.Checks) {
 		writeError(w, http.StatusBadRequest, "must record an outcome for every attached check")
@@ -203,16 +218,11 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	step.Checks = append([]domain.StepCheck{}, payload.Checks...)
-	allSuccess := true
-	for _, check := range step.Checks {
-		if check.Status != "success" {
-			allSuccess = false
-		}
-	}
 	step.Confirmed = true
-	step.Effective = allSuccess
-	// Move the step out of the planned list into the executed history,
-	// keeping its check record verbatim for any later route.
+	step.Effective = checksAllSuccess(step.Checks)
+	// Move the step out of the planned list into the executed history.
+	// Execution is a fact: even when checks are incomplete the version
+	// changes already happened and flow into the executed state.
 	remaining := []domain.RouteStep{}
 	for _, item := range saved.Report.Steps {
 		if item.Index != payload.StepIndex {
@@ -222,9 +232,10 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 	saved.Report.Steps = remaining
 	saved.Report.ConfirmedSteps = append(saved.Report.ConfirmedSteps, *step)
 	saved.Request.Confirmed = append(saved.Request.Confirmed, *step)
-	if !allSuccess {
+	if !step.Effective {
 		// A step whose checks did not all succeed stays visible as held:
-		// its record is preserved but it never counts as completed.
+		// its record is preserved for backfill, but its conversion still
+		// counts as executed.
 		saved.Report.HeldSteps = append(saved.Report.HeldSteps, *step)
 	}
 	saved.ExecutedState, saved.Irreversible = route.ExecutedSummary(saved.Request, saved.Report)
@@ -233,6 +244,74 @@ func (s *Server) handleRouteConfirm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, *saved)
+}
+
+func checksAllSuccess(checks []domain.StepCheck) bool {
+	for _, check := range checks {
+		if check.Status != "success" {
+			return false
+		}
+	}
+	return true
+}
+
+// backfillOnly reports whether the new record differs from the stored one
+// exclusively by turning 资料不足 checks into determined outcomes (success
+// or failed). Everything else — check ids, count, and any already
+// determined outcome — must match, so executed history is never rewritten.
+func backfillOnly(stored, payload []domain.StepCheck) bool {
+	if len(stored) != len(payload) {
+		return false
+	}
+	byID := map[string]domain.StepCheck{}
+	for _, check := range stored {
+		byID[check.ID] = check
+	}
+	backfilled := false
+	for _, check := range payload {
+		old, ok := byID[check.ID]
+		if !ok {
+			return false
+		}
+		if old.Status == check.Status {
+			continue
+		}
+		if old.Status != "insufficient" {
+			return false
+		}
+		if check.Status != "success" && check.Status != "failed" {
+			return false
+		}
+		backfilled = true
+	}
+	return backfilled
+}
+
+// syncExecutedStep propagates a backfilled check record to every place the
+// executed step is stored: confirmed history, held list and the frozen
+// request, so a reopened route and any replan see the same record.
+func syncExecutedStep(saved *domain.SavedRoute, step *domain.RouteStep) {
+	for i := range saved.Report.ConfirmedSteps {
+		if saved.Report.ConfirmedSteps[i].Index == step.Index {
+			saved.Report.ConfirmedSteps[i] = *step
+		}
+	}
+	held := saved.Report.HeldSteps[:0]
+	for _, item := range saved.Report.HeldSteps {
+		if item.Index == step.Index {
+			if !step.Effective {
+				held = append(held, *step)
+			}
+			continue
+		}
+		held = append(held, item)
+	}
+	saved.Report.HeldSteps = held
+	for i := range saved.Request.Confirmed {
+		if saved.Request.Confirmed[i].Index == step.Index {
+			saved.Request.Confirmed[i] = *step
+		}
+	}
 }
 
 func findStep(saved *domain.SavedRoute, index int) *domain.RouteStep {

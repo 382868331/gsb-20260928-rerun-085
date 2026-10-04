@@ -27,42 +27,39 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 	confirmed := make([]domain.RouteStep, 0, len(req.Confirmed))
 	held := []domain.RouteStep{}
 	for i, step := range req.Confirmed {
-		if len(held) > 0 {
-			// A later confirmed step cannot be effective once an earlier one
-			// is held: its recorded state builds on a state that never
-			// verifiably happened. Keep the record, do not apply it.
-			step.Effective = false
-			held = append(held, step)
-			continue
-		}
-		if !stepEffective(step) {
-			step.Effective = false
-			held = append(held, step)
-			continue
-		}
+		// Every confirmed step was physically executed: apply its changes
+		// to the real state no matter how its checks turned out. A check
+		// recorded as failed or 资料不足 does not undo a data conversion
+		// that already ran, so it must never roll the state back.
 		previous := cloneMap(state)
 		state = applyChanges(state, step.Changes)
 		if provided := step.State; len(provided) > 0 && !sameState(state, provided) {
 			report := failRoute(req, fmt.Sprintf("已确认的第 %d 步与当前状态不一致：历史步骤不能被重算成另一条路线", i+1), nil)
 			report.ConfirmedSteps = confirmed
-			report.HeldSteps = held
+			report.HeldSteps = append(held, step)
 			report.Options = buildOptions(req.Manifest, goals, state, executedWithImpacts(confirmed, held), req.Current)
 			return report
 		}
 		step.Index = i + 1
 		step.State = cloneMap(state)
 		step.Confirmed = true
-		step.Effective = true
+		step.Effective = stepEffective(step)
 		step.Verification = verifyState(req.Manifest, state, stepGoals(goals, state, step.Changes))
 		if step.Verification.Status != "feasible" {
 			report := failRoute(req, fmt.Sprintf("已确认的第 %d 步留下的中间状态无法通过独立核验", i+1), step.Verification.Checks)
 			report.ConfirmedSteps = confirmed
-			report.HeldSteps = held
+			report.HeldSteps = append(held, step)
 			report.ResumedFrom = cloneMap(previous)
 			report.Options = buildOptions(req.Manifest, goals, previous, executedWithImpacts(confirmed, held), req.Current)
 			return report
 		}
 		confirmed = append(confirmed, step)
+		if !step.Effective {
+			// Executed but not yet verified: keep the record visible as
+			// held so the missing checks can be backfilled, while planning
+			// continues from the state the step actually left behind.
+			held = append(held, step)
+		}
 	}
 
 	solveReport := solver.Solve(domain.SolveRequest{
@@ -125,25 +122,36 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 // executedWithImpacts treats every physically executed step as a source of
 // irreversible impact, including held steps whose checks failed or are
 // insufficient: a failed check never undoes a data conversion that already
-// ran, so its impact must survive into every option.
+// ran, so its impact must survive into every option. Held steps also appear
+// in the confirmed list, so duplicates are merged by step index.
 func executedWithImpacts(confirmed, held []domain.RouteStep) []domain.RouteStep {
 	out := append([]domain.RouteStep{}, confirmed...)
-	return append(out, held...)
+	seen := map[int]bool{}
+	for _, step := range out {
+		seen[step.Index] = true
+	}
+	for _, step := range held {
+		if !seen[step.Index] {
+			out = append(out, step)
+		}
+	}
+	return out
 }
 
 // ExecutedSummary separates what actually happened from what was only
-// planned: the running set reached by effective steps alone, and every
-// irreversible data impact incurred by executed steps (held ones included).
+// planned: the running set reached by every executed step (held ones
+// included — a missing or failed check never erases a migration that
+// already ran), and every irreversible data impact they incurred.
 func ExecutedSummary(req domain.RouteRequest, report domain.RouteReport) (map[string]string, []string) {
 	state := cloneMap(req.Current)
-	for _, step := range report.ConfirmedSteps {
-		if step.Effective {
-			state = applyChanges(state, step.Changes)
-		}
+	executed := executedWithImpacts(report.ConfirmedSteps, report.HeldSteps)
+	sort.SliceStable(executed, func(i, j int) bool { return executed[i].Index < executed[j].Index })
+	for _, step := range executed {
+		state = applyChanges(state, step.Changes)
 	}
 	impacts := []string{}
 	seen := map[string]bool{}
-	for _, step := range executedWithImpacts(report.ConfirmedSteps, report.HeldSteps) {
+	for _, step := range executed {
 		for _, impact := range step.Rollback.Irreversible {
 			if !seen[impact] {
 				seen[impact] = true
@@ -154,10 +162,11 @@ func ExecutedSummary(req domain.RouteRequest, report domain.RouteReport) (map[st
 	return state, impacts
 }
 
-// stepEffective reports whether a confirmed step may be treated as really
-// done: the user must have recorded every attached check as a success.
-// A step that only exists in a plan, or whose checks are pending, failed or
-// 资料不足, never counts as executed no matter what the plan claims.
+// stepEffective reports whether an executed step is also verified: the user
+// must have recorded every attached check as a success. Effectiveness only
+// gates verification — the step's version changes count as executed either
+// way, because a data conversion that already ran cannot be un-happened by
+// missing evidence.
 func stepEffective(step domain.RouteStep) bool {
 	for _, check := range step.Checks {
 		if check.Status != "success" {
@@ -204,14 +213,20 @@ func printableFrom(from string) string {
 	return from
 }
 
-// buildOptions lays out the three ways forward from the current real state:
-// keep the state and fix the remaining route, roll back to the last
-// still-compatible old state, or stop. Each option lists the impacts it
-// does not resolve, including data transformations versions cannot undo.
+// buildOptions lays out the ways forward from the current real state:
+// keep the state and fix the remaining route, backfill missing check
+// evidence (verification only, never re-executing the conversion), roll
+// back to the last still-compatible old state, or stop. Each option lists
+// the impacts it does not resolve, including data transformations versions
+// cannot undo.
 func buildOptions(manifest domain.Manifest, goals []domain.MigrationGoal, current map[string]string, executed []domain.RouteStep, base map[string]string) []domain.RouteOption {
 	irreversible := []string{}
+	heldIndexes := []string{}
 	for _, step := range executed {
 		irreversible = append(irreversible, step.Rollback.Irreversible...)
+		if step.Confirmed && !step.Effective {
+			heldIndexes = append(heldIndexes, fmt.Sprintf("第 %d 步", step.Index))
+		}
 	}
 	unmet := []string{}
 	report := verifyState(manifest, current, goals)
@@ -234,6 +249,16 @@ func buildOptions(manifest domain.Manifest, goals []domain.MigrationGoal, curren
 			State:   cloneMap(current),
 			Impacts: orNone(append(append([]string{}, irreversible...), unmet...), "无遗留影响"),
 		},
+	}
+	if len(heldIndexes) > 0 {
+		options = append(options, domain.RouteOption{
+			Kind:    "backfill",
+			Summary: "补齐核对资料，仅更新核对结论，不重复执行转换",
+			State:   cloneMap(current),
+			Impacts: []string{
+				fmt.Sprintf("%s 的核对尚未全部成功：补录只更新核对记录，已执行的数据转换与版本状态保持不变", strings.Join(heldIndexes, "、")),
+			},
+		})
 	}
 	if len(executed) > 0 {
 		rollbackState := cloneMap(base)

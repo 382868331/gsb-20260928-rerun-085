@@ -101,10 +101,15 @@ type RouteStep struct {
 	Checks       []StepCheck       `json:"checks,omitempty"`
 	Verification Report            `json:"verification"`
 	Rollback     RollbackInfo      `json:"rollback"`
-	Confirmed    bool              `json:"confirmed,omitempty"`
-	// Effective is true only when the step was confirmed AND every attached
-	// check was recorded as a success by the user. A plan claiming success
-	// is never enough on its own.
+	// Confirmed marks the step as physically executed: the user recorded
+	// check outcomes for it. Execution is a fact and is tracked separately
+	// from whether the checks passed.
+	Confirmed bool `json:"confirmed,omitempty"`
+	// Effective is true only when the step was executed AND every attached
+	// check was recorded as a success by the user. A step can be executed
+	// (its data migration already ran) without being effective yet: checks
+	// that are pending, failed or 资料不足 only block verification, never
+	// the executed state.
 	Effective bool `json:"effective,omitempty"`
 }
 
@@ -150,11 +155,12 @@ type RouteRequest struct {
 }
 
 type RouteReport struct {
-	Status             string            `json:"status"`
-	ResumedFrom        map[string]string `json:"resumedFrom"`
-	ConfirmedSteps     []RouteStep       `json:"confirmedSteps,omitempty"`
-	// HeldSteps are confirmed steps whose checks are not all successful;
-	// they are preserved verbatim but planning does not treat them as done.
+	Status         string            `json:"status"`
+	ResumedFrom    map[string]string `json:"resumedFrom"`
+	ConfirmedSteps []RouteStep       `json:"confirmedSteps,omitempty"`
+	// HeldSteps are executed steps whose checks are not all successful;
+	// they are preserved verbatim. Their version changes DID happen and
+	// count toward the real state — only their verification is pending.
 	HeldSteps          []RouteStep       `json:"heldSteps,omitempty"`
 	Steps              []RouteStep       `json:"steps"`
 	FinalSelection     map[string]string `json:"finalSelection,omitempty"`
@@ -168,9 +174,12 @@ type SavedRoute struct {
 	Fingerprint string       `json:"fingerprint,omitempty"`
 	Request     RouteRequest `json:"request"`
 	Report      RouteReport  `json:"report"`
-	// ExecutedState is the running set actually reached so far (effective
-	// steps only), stored separately from the plan and the final selection
-	// so a reopened route never mistakes planned versions for reality.
+	// ExecutedState is the running set actually reached so far, built from
+	// every executed step (confirmed ones, including held steps whose
+	// checks are incomplete). It is stored separately from the plan and
+	// the final selection so a reopened route never mistakes planned
+	// versions for reality, and insufficient check data never erases a
+	// migration that already ran.
 	ExecutedState map[string]string `json:"executedState,omitempty"`
 	// Irreversible accumulates data impacts from every executed step,
 	// including held steps whose checks failed: a failed check does not
@@ -181,8 +190,10 @@ type SavedRoute struct {
 
 // ConfirmRequest records the user's check outcomes for one step of a saved
 // route. Re-sending the identical record is a no-op (save interruptions must
-// not re-execute one-time transformations); a different record for the same
-// step is rejected because executed history cannot be overwritten.
+// not re-execute one-time transformations). A record that only backfills
+// 资料不足 checks with determined outcomes updates the verification without
+// re-running the conversion; any other attempt to rewrite a recorded check
+// is rejected because executed history cannot be overwritten.
 type ConfirmRequest struct {
 	RouteID   string      `json:"routeId"`
 	StepIndex int         `json:"stepIndex"`

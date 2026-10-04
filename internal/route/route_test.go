@@ -237,7 +237,7 @@ func TestPlannedStepsCarryPendingChecks(t *testing.T) {
 	}
 }
 
-func TestUnrecordedOrFailedChecksHoldTheStep(t *testing.T) {
+func TestExecutedStepWithIncompleteChecksStaysHeldButCounts(t *testing.T) {
 	initial := Plan(domain.RouteRequest{
 		Manifest:       mutualManifest(),
 		Current:        map[string]string{"app": "1.0.0", "lib": "1.0.0"},
@@ -266,17 +266,19 @@ func TestUnrecordedOrFailedChecksHoldTheStep(t *testing.T) {
 				DesiredVersion: "3.0.0",
 				Confirmed:      []domain.RouteStep{step},
 			})
-			if len(report.ConfirmedSteps) != 0 {
-				t.Fatalf("step without successful checks must not count as done, got %+v", report.ConfirmedSteps)
+			if len(report.ConfirmedSteps) != 1 {
+				t.Fatalf("executed step must stay in the confirmed history, got %+v", report.ConfirmedSteps)
 			}
 			if len(report.HeldSteps) != 1 || report.HeldSteps[0].Effective {
 				t.Fatalf("step must be held with its record preserved, got %+v", report.HeldSteps)
 			}
-			if report.ResumedFrom["app"] != "1.0.0" {
-				t.Fatalf("planning must resume from the truly completed state, got %v", report.ResumedFrom)
+			// The conversion already ran: planning resumes from the real
+			// state the step left behind, never re-scheduling it.
+			if report.ResumedFrom["app"] != "2.0.0" {
+				t.Fatalf("planning must resume from the executed state, got %v", report.ResumedFrom)
 			}
-			if len(report.Steps) != 2 {
-				t.Fatalf("remaining route must be replanned from the real state, got %+v", report.Steps)
+			if len(report.Steps) != 1 {
+				t.Fatalf("the executed conversion must not be planned again, got %+v", report.Steps)
 			}
 		})
 	}
@@ -351,9 +353,23 @@ func TestFailedCheckDataConversionStillCountsAsHappened(t *testing.T) {
 			t.Fatalf("option %s must keep the irreversible data impact of the executed step, got %v", option.Kind, option.Impacts)
 		}
 	}
-	// Version planning still resumes from the truly verified state.
-	if report.ResumedFrom["app"] != "1.0.0" {
-		t.Fatalf("planning resumes from the verified state, got %v", report.ResumedFrom)
+	// Version planning resumes from the real executed state: the failed
+	// check does not resurrect app 1.0.0.
+	if report.ResumedFrom["app"] != "2.0.0" {
+		t.Fatalf("planning resumes from the executed state, got %v", report.ResumedFrom)
+	}
+	// A backfill option is offered:补齐资料只更新核对，不重复执行转换。
+	foundBackfill := false
+	for _, option := range report.Options {
+		if option.Kind == "backfill" {
+			foundBackfill = true
+			if option.State["app"] != "2.0.0" {
+				t.Fatalf("backfill keeps the executed state, got %v", option.State)
+			}
+		}
+	}
+	if !foundBackfill {
+		t.Fatalf("held steps must offer a backfill option, got %+v", report.Options)
 	}
 }
 

@@ -314,6 +314,187 @@ func contains(haystack, needle string) bool {
 	return bytes.Contains([]byte(haystack), []byte(needle))
 }
 
+// The reported scenario: the joint app/lib 1.0.0 -> 2.0.0 conversion was
+// executed, three checks are recorded as success and the last one as
+// 资料不足. The executed state must move to 2.0.0, replanning must not
+// schedule the same conversion again, and backfilling the missing evidence
+// only updates the verification record.
+func TestInsufficientCheckKeepsExecutedConversionAndAllowsBackfill(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d", status)
+	}
+	routeID, _ := saved["id"].(string)
+	report := saved["report"].(map[string]any)
+	steps, _ := report["steps"].([]any)
+	first := steps[0].(map[string]any)
+	checks, _ := first["checks"].([]any)
+	if len(checks) != 4 {
+		t.Fatalf("joint conversion should carry 4 checks, got %v", checks)
+	}
+	recorded := []map[string]any{}
+	for i, item := range checks {
+		check := item.(map[string]any)
+		status := "success"
+		if i == len(checks)-1 {
+			status = "insufficient"
+		}
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": status})
+	}
+	confirm := map[string]any{"routeId": routeID, "stepIndex": 1, "checks": recorded}
+	status, confirmed := do(t, handler, http.MethodPost, "/api/routes/confirm", confirm)
+	if status != http.StatusOK {
+		t.Fatalf("confirm status %d: %v", status, confirmed)
+	}
+	// Executed fact and verification are stored separately: the real state
+	// is 2.0.0 even though one check is still 资料不足.
+	executed, _ := confirmed["executedState"].(map[string]any)
+	if executed["app"] != "2.0.0" || executed["lib"] != "2.0.0" {
+		t.Fatalf("executed state must record the real versions, got %v", executed)
+	}
+	confirmedReport := confirmed["report"].(map[string]any)
+	held, _ := confirmedReport["heldSteps"].([]any)
+	if len(held) != 1 {
+		t.Fatalf("step with insufficient evidence must stay held, got %v", confirmedReport)
+	}
+	impacts, _ := confirmed["irreversible"].([]any)
+	if len(impacts) == 0 {
+		t.Fatalf("the executed data migration must stay listed as irreversible, got %v", confirmed)
+	}
+
+	// Duplicate submission of the identical record is a no-op.
+	status, again := do(t, handler, http.MethodPost, "/api/routes/confirm", confirm)
+	if status != http.StatusOK {
+		t.Fatalf("idempotent replay status %d: %v", status, again)
+	}
+	againHeld, _ := again["report"].(map[string]any)["heldSteps"].([]any)
+	if len(againHeld) != 1 {
+		t.Fatalf("replay must not duplicate the held step, got %v", again)
+	}
+
+	// Replanning continues from the real version and never re-schedules
+	// the executed conversion; the options explain stop/backfill/rollback.
+	replanPayload := routeRequestFrom(sample)
+	replanPayload["confirmed"] = confirmedReport["confirmedSteps"]
+	_, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
+	resumed, _ := replanned["resumedFrom"].(map[string]any)
+	if resumed["app"] != "2.0.0" {
+		t.Fatalf("replan must resume from the executed state, got %v", resumed)
+	}
+	for _, item := range replanned["steps"].([]any) {
+		for _, raw := range item.(map[string]any)["changes"].([]any) {
+			if raw.(map[string]any)["from"] == "1.0.0" {
+				t.Fatalf("executed conversion must not be planned again: %v", replanned["steps"])
+			}
+		}
+	}
+	optionKinds := map[string]bool{}
+	for _, raw := range replanned["options"].([]any) {
+		option := raw.(map[string]any)
+		optionKinds[option["kind"].(string)] = true
+	}
+	for _, kind := range []string{"stop", "backfill", "rollback"} {
+		if !optionKinds[kind] {
+			t.Fatalf("option %s must be offered, got %v", kind, replanned["options"])
+		}
+	}
+
+	// Mid-way goal change: switching the final goal to app 2.0.0 shows the
+	// goal already reached by the executed state, with no remaining steps.
+	changedGoal := routeRequestFrom(sample)
+	changedGoal["desiredVersion"] = "2.0.0"
+	changedGoal["confirmed"] = confirmedReport["confirmedSteps"]
+	_, replanned2 := do(t, handler, http.MethodPost, "/api/route/plan", changedGoal)
+	if steps2, _ := replanned2["steps"].([]any); len(steps2) != 0 {
+		t.Fatalf("goal already reached by the executed state, got %v", steps2)
+	}
+
+	// Backfill: only the 资料不足 check gains a determined outcome.
+	backfilled := []map[string]any{}
+	for _, item := range recorded {
+		entry := map[string]any{"id": item["id"], "label": item["label"], "status": item["status"]}
+		backfilled = append(backfilled, entry)
+	}
+	backfilled[len(backfilled)-1]["status"] = "success"
+	backfilled[len(backfilled)-1]["note"] = "补充的迁移校验记录"
+	status, filled := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": backfilled,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("backfill status %d: %v", status, filled)
+	}
+	filledReport := filled["report"].(map[string]any)
+	if heldAfter, _ := filledReport["heldSteps"].([]any); len(heldAfter) != 0 {
+		t.Fatalf("backfill must clear the held step, got %v", filledReport)
+	}
+	filledSteps, _ := filledReport["confirmedSteps"].([]any)
+	if len(filledSteps) != 1 {
+		t.Fatalf("backfill must not duplicate the executed step, got %v", filledReport)
+	}
+	filledStep := filledSteps[0].(map[string]any)
+	if effective, _ := filledStep["effective"].(bool); !effective {
+		t.Fatalf("backfilled step must become effective, got %v", filledStep)
+	}
+	// Backfill only updates checks: the executed state is untouched and no
+	// conversion was re-run.
+	executedAfter, _ := filled["executedState"].(map[string]any)
+	if executedAfter["app"] != "2.0.0" || executedAfter["lib"] != "2.0.0" {
+		t.Fatalf("backfill must not change the executed state, got %v", executedAfter)
+	}
+
+	// Replaying the backfilled record is idempotent.
+	status, _ = do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": backfilled,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("replaying the backfilled record must be idempotent, got %d", status)
+	}
+	// Rewriting an already determined check is still rejected.
+	conflicting := []map[string]any{}
+	for _, item := range backfilled {
+		entry := map[string]any{"id": item["id"], "label": item["label"], "status": item["status"]}
+		conflicting = append(conflicting, entry)
+	}
+	conflicting[0]["status"] = "failed"
+	status, conflict := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": 1, "checks": conflicting,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("rewriting a determined check must fail, got %d: %v", status, conflict)
+	}
+
+	// Save-reopen: the stored route keeps the executed state, the
+	// backfilled verification and the irreversible impacts.
+	req := httptest.NewRequest(http.MethodGet, "/api/routes", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	var routes []domain.SavedRoute
+	if err := json.Unmarshal(rec.Body.Bytes(), &routes); err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("expected 1 route, got %d", len(routes))
+	}
+	reopened := routes[0]
+	if reopened.ExecutedState["app"] != "2.0.0" || reopened.ExecutedState["lib"] != "2.0.0" {
+		t.Fatalf("reopened route must keep the executed state, got %v", reopened.ExecutedState)
+	}
+	if len(reopened.Report.HeldSteps) != 0 || len(reopened.Report.ConfirmedSteps) != 1 {
+		t.Fatalf("reopened route must keep the backfilled history, got %+v", reopened.Report)
+	}
+	if !reopened.Report.ConfirmedSteps[0].Effective {
+		t.Fatalf("reopened step must be effective after backfill, got %+v", reopened.Report.ConfirmedSteps[0])
+	}
+	if len(reopened.Irreversible) == 0 {
+		t.Fatalf("reopened route must keep the irreversible impacts, got %+v", reopened)
+	}
+	if len(reopened.Request.Confirmed) != 1 || !reopened.Request.Confirmed[0].Effective {
+		t.Fatalf("frozen request must carry the backfilled record, got %+v", reopened.Request.Confirmed)
+	}
+}
+
 func routeRequestFrom(req domain.SolveRequest) map[string]any {
 	return map[string]any{
 		"manifest":       req.Manifest,
@@ -510,10 +691,11 @@ func TestSavedRouteSeparatesPlanExecutedStateAndImpacts(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("confirm status %d: %v", status, updated)
 	}
-	// The failed step's version change must not leak into the executed state.
+	// The failed step's version change DID happen: the executed state moves
+	// to app 2.0.0 while the step stays held for its verification record.
 	executed, _ = updated["executedState"].(map[string]any)
-	if executed["app"] != "1.0.0" {
-		t.Fatalf("failed step must not change the executed state, got %v", executed)
+	if executed["app"] != "2.0.0" {
+		t.Fatalf("executed conversion must be reflected in the executed state, got %v", executed)
 	}
 	impacts, _ := updated["irreversible"].([]any)
 	if len(impacts) == 0 {
@@ -530,7 +712,7 @@ func TestSavedRouteSeparatesPlanExecutedStateAndImpacts(t *testing.T) {
 	if len(routes) != 1 {
 		t.Fatalf("expected 1 route, got %d", len(routes))
 	}
-	if routes[0].ExecutedState["app"] != "1.0.0" || len(routes[0].Irreversible) == 0 {
+	if routes[0].ExecutedState["app"] != "2.0.0" || len(routes[0].Irreversible) == 0 {
 		t.Fatalf("reopened route must keep executed state and impacts, got %+v", routes[0])
 	}
 	if len(routes[0].Report.HeldSteps) != 1 {
@@ -538,7 +720,7 @@ func TestSavedRouteSeparatesPlanExecutedStateAndImpacts(t *testing.T) {
 	}
 }
 
-func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
+func TestRouteConfirmInsufficientKeepsExecutedState(t *testing.T) {
 	handler := setup(t)
 	sample := scenario(t, handler, "transition")
 	status, saved := do(t, handler, http.MethodPost, "/api/routes", routeRequestFrom(sample))
@@ -566,8 +748,14 @@ func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 	if len(confirmedSteps) != 1 {
 		t.Fatalf("record must be preserved even when insufficient, got %v", confirmedReport)
 	}
-	// Replanning must not treat the step as done: it stays held and the
-	// route resumes from the state before it.
+	// 资料不足 does not erase the executed migration: the executed state
+	// already runs app 2.0.0, the step stays held for its verification,
+	// and replanning continues from the real version instead of
+	// scheduling the same conversion again.
+	executed, _ := confirmed["executedState"].(map[string]any)
+	if executed["app"] != "2.0.0" {
+		t.Fatalf("insufficient data must not roll back the executed state, got %v", executed)
+	}
 	replanPayload := routeRequestFrom(sample)
 	replanPayload["confirmed"] = confirmedReport["confirmedSteps"]
 	_, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
@@ -576,7 +764,18 @@ func TestRouteConfirmInsufficientStaysPending(t *testing.T) {
 		t.Fatalf("insufficient checks must keep the step held, got %v", replanned)
 	}
 	resumed, _ := replanned["resumedFrom"].(map[string]any)
-	if resumed["app"] != "1.0.0" {
-		t.Fatalf("planning must resume from the truly completed state, got %v", resumed)
+	if resumed["app"] != "2.0.0" {
+		t.Fatalf("planning must resume from the executed state, got %v", resumed)
+	}
+	remaining, _ := replanned["steps"].([]any)
+	for _, item := range remaining {
+		step := item.(map[string]any)
+		changes, _ := step["changes"].([]any)
+		for _, raw := range changes {
+			change := raw.(map[string]any)
+			if change["from"] == "1.0.0" {
+				t.Fatalf("the executed conversion must not be planned again, got %v", remaining)
+			}
+		}
 	}
 }
