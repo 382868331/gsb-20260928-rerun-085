@@ -102,7 +102,15 @@ func Plan(req domain.RouteRequest) domain.RouteReport {
 	resumed := cloneMap(state)
 
 	steps := []domain.RouteStep{}
+	// New steps must continue after every recorded step, held ones
+	// included: a held step keeps its original index and check IDs, so a
+	// collision would let a later 补录 land on the wrong step's record.
 	index := len(confirmed)
+	for _, step := range held {
+		if step.Index > index {
+			index = step.Index
+		}
+	}
 	for {
 		pending := pendingChanges(state, final)
 		if len(pending) == 0 {

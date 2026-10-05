@@ -754,3 +754,143 @@ func TestRouteConfirmSupplementUpdatesChecksOnly(t *testing.T) {
 		}
 	}
 }
+
+// A step held for 资料不足 keeps its original index when the remaining
+// route is planned around it; otherwise a later 补录 could land on the
+// pending next step's record (same index, same generated check IDs) and
+// register a conversion that never ran. Covers the plan-confirm-save
+// flow, save/reopen, repeated supplements and a midway goal change.
+func TestRouteSupplementMatchesHeldStepNotPendingStep(t *testing.T) {
+	handler := setup(t)
+	sample := scenario(t, handler, "transition")
+	status, planned := do(t, handler, http.MethodPost, "/api/route/plan", routeRequestFrom(sample))
+	if status != http.StatusOK {
+		t.Fatalf("plan status %d", status)
+	}
+	steps, _ := planned["steps"].([]any)
+	if len(steps) < 2 {
+		t.Fatalf("transition route must have several steps, got %v", steps)
+	}
+	first := steps[0].(map[string]any)
+	checks, _ := first["checks"].([]any)
+	recorded := []map[string]any{}
+	for i, item := range checks {
+		check := item.(map[string]any)
+		checkStatus := "success"
+		if i == len(checks)-1 {
+			checkStatus = "insufficient"
+		}
+		recorded = append(recorded, map[string]any{"id": check["id"], "label": check["label"], "status": checkStatus})
+	}
+	first["checks"] = recorded
+	first["confirmed"] = true
+	// Confirm inside the plan request, then save: the held step and the
+	// pending steps are frozen into the same record.
+	payload := routeRequestFrom(sample)
+	payload["confirmed"] = []any{first}
+	status, saved := do(t, handler, http.MethodPost, "/api/routes", payload)
+	if status != http.StatusCreated {
+		t.Fatalf("save status %d: %v", status, saved)
+	}
+	routeID, _ := saved["id"].(string)
+	report := saved["report"].(map[string]any)
+	held, _ := report["heldSteps"].([]any)
+	remaining, _ := report["steps"].([]any)
+	if len(held) != 1 || len(remaining) != len(steps)-1 {
+		t.Fatalf("saved route must keep the held step and the remaining steps, got %v", report)
+	}
+	heldIndex := int(held[0].(map[string]any)["index"].(float64))
+	for _, item := range remaining {
+		pending := item.(map[string]any)
+		if int(pending["index"].(float64)) == heldIndex {
+			t.Fatalf("pending step must never reuse the held step's index, got %v", report)
+		}
+	}
+	// Save/reopen: supplement the held step through the reopened record.
+	supplemented := []map[string]any{}
+	for i, item := range recorded {
+		checkStatus := item["status"]
+		if i == len(recorded)-1 {
+			checkStatus = "success"
+		}
+		supplemented = append(supplemented, map[string]any{"id": item["id"], "label": item["label"], "status": checkStatus, "note": "补齐冒烟报告"})
+	}
+	status, filled := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": heldIndex, "checks": supplemented,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("supplement status %d: %v", status, filled)
+	}
+	filledReport := filled["report"].(map[string]any)
+	// 补录只更新该次核对: the real version stays 2.0.0, no conversion is
+	// added, and the remaining steps are not consumed.
+	executed, _ := filled["executedState"].(map[string]any)
+	if executed["app"] != "2.0.0" || executed["lib"] != "2.0.0" {
+		t.Fatalf("supplement must not move the real state, got %v", executed)
+	}
+	filledRemaining, _ := filledReport["steps"].([]any)
+	if len(filledRemaining) != len(remaining) {
+		t.Fatalf("supplement must not consume remaining steps, got %v", filledReport)
+	}
+	for _, item := range filledRemaining {
+		pending := item.(map[string]any)
+		if done, _ := pending["executed"].(bool); done {
+			t.Fatalf("pending step must not be registered as executed, got %v", pending)
+		}
+	}
+	if stillHeld, _ := filledReport["heldSteps"].([]any); len(stillHeld) != 0 {
+		t.Fatalf("fully supplemented step must leave the held list, got %v", stillHeld)
+	}
+	filledConfirmed, _ := filledReport["confirmedSteps"].([]any)
+	if len(filledConfirmed) != 1 {
+		t.Fatalf("supplemented step must appear once in the confirmed history, got %v", filledConfirmed)
+	}
+	supplementedStep := filledConfirmed[0].(map[string]any)
+	if effective, _ := supplementedStep["effective"].(bool); !effective {
+		t.Fatalf("supplemented step must become effective, got %v", supplementedStep)
+	}
+	for _, raw := range supplementedStep["changes"].([]any) {
+		change := raw.(map[string]any)
+		if change["to"] != "2.0.0" {
+			t.Fatalf("supplement must attach to the original 1.0.0 -> 2.0.0 record, got %v", change)
+		}
+	}
+	// Repeating the same supplement is idempotent and changes nothing.
+	status, replay := do(t, handler, http.MethodPost, "/api/routes/confirm", map[string]any{
+		"routeId": routeID, "stepIndex": heldIndex, "checks": supplemented,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("repeated supplement must be idempotent, got %d: %v", status, replay)
+	}
+	replayReport := replay["report"].(map[string]any)
+	if remainingAfter, _ := replayReport["steps"].([]any); len(remainingAfter) != len(remaining) {
+		t.Fatalf("repeated supplement must keep the remaining route, got %v", replayReport)
+	}
+	if replay["executedState"].(map[string]any)["app"] != "2.0.0" {
+		t.Fatalf("repeated supplement must keep the real state, got %v", replay["executedState"])
+	}
+	// Reopen and change the final goal: planning resumes from the real
+	// 2.0.0 state, the executed conversions and the remaining route stay
+	// consistent with before.
+	replanPayload := routeRequestFrom(sample)
+	replanPayload["confirmed"] = filledReport["confirmedSteps"]
+	status, replanned := do(t, handler, http.MethodPost, "/api/route/plan", replanPayload)
+	if status != http.StatusOK {
+		t.Fatalf("replan status %d: %v", status, replanned)
+	}
+	if resumed, _ := replanned["resumedFrom"].(map[string]any); resumed["app"] != "2.0.0" {
+		t.Fatalf("replan must resume from the real 2.0.0 state, got %v", resumed)
+	}
+	replanSteps, _ := replanned["steps"].([]any)
+	if len(replanSteps) != len(remaining) {
+		t.Fatalf("replan must keep the same remaining route, got %v", replanned)
+	}
+	for _, item := range replanSteps {
+		for _, raw := range item.(map[string]any)["changes"].([]any) {
+			change := raw.(map[string]any)
+			if change["from"] == "1.0.0" {
+				t.Fatalf("executed conversion must not be planned again, got %v", change)
+			}
+		}
+	}
+}

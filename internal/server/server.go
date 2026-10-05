@@ -315,10 +315,18 @@ func (s *Server) refreshStep(saved *domain.SavedRoute, step *domain.RouteStep) {
 		}
 	}
 	step.Effective = allSuccess
+	foundConfirmed := false
 	for i := range saved.Report.ConfirmedSteps {
 		if saved.Report.ConfirmedSteps[i].Index == step.Index {
 			saved.Report.ConfirmedSteps[i] = *step
+			foundConfirmed = true
 		}
+	}
+	if !foundConfirmed {
+		// A step held straight from a saved plan never entered the
+		// confirmed history; its supplemented record must join it so the
+		// executed conversion stays traceable after save/reopen.
+		saved.Report.ConfirmedSteps = append(saved.Report.ConfirmedSteps, *step)
 	}
 	held := saved.Report.HeldSteps[:0]
 	foundHeld := false
@@ -348,6 +356,11 @@ func findStep(saved *domain.SavedRoute, index int) *domain.RouteStep {
 	for i := range saved.Report.ConfirmedSteps {
 		if saved.Report.ConfirmedSteps[i].Index == index {
 			return &saved.Report.ConfirmedSteps[i]
+		}
+	}
+	for i := range saved.Report.HeldSteps {
+		if saved.Report.HeldSteps[i].Index == index {
+			return &saved.Report.HeldSteps[i]
 		}
 	}
 	for i := range saved.Report.Steps {
